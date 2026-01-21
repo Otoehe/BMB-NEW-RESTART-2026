@@ -1,356 +1,134 @@
-import React, {useState, useEffect, useRef} from "react";
-import {useNavigate, useParams} from "react-router-dom";
-import Map, {Marker, NavigationControl, MapRef} from "react-map-gl/mapbox";
-import "mapbox-gl/dist/mapbox-gl.css";
+import React, {useState, useEffect} from "react";
+import {useParams, useNavigate} from "react-router-dom";
 import {supabase} from "../../lib/supabaseClient";
-import {useAuth} from "../../context/AuthProvider";
-import {toast} from 'react-toastify';
-
-const MAPBOX_TOKEN = "pk.eyJ1IjoiYnV5bXliaWhhdmlvciIsImEiOiJjbWM4MzU3cDQxZGJ0MnFzM3NnOHhnaWM4In0.wShhGG9EvmIVxcHjBHImXw";
+import {toast} from "react-toastify";
 
 export default function EditOrderPage() {
-    const {user} = useAuth();
-    const navigate = useNavigate();
     const {orderId} = useParams();
-    const mapRef = useRef<MapRef>(null);
+    const navigate = useNavigate();
 
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
+    const [orderData, setOrderData] = useState<any>(null);
 
-    // Поля форми
     const [title, setTitle] = useState("");
     const [description, setDescription] = useState("");
-    const [date, setDate] = useState("");
-    const [time, setTime] = useState("");
+    const [price, setPrice] = useState<number>(0);
 
-    // Координати
-    const [coords, setCoords] = useState<{ lat: number, lng: number } | null>(null); // Поточні (нові)
-    const [originalCoords, setOriginalCoords] = useState<{ lat: number, lng: number } | null>(null); // Минулі (старі)
-
-    const [scenarioId, setScenarioId] = useState<number | null>(null);
-
-    // --- НЕЗМІННІ ДАНІ (READ-ONLY) ---
-    const [readOnlyInfo, setReadOnlyInfo] = useState({
-        price: 0,
-        status: "",
-        execution_time: ""
-    });
-    const [timeLeft, setTimeLeft] = useState<string>("Calculating...");
-
-    // Завантаження даних
     useEffect(() => {
-        const fetchOrder = async () => {
-            if (!user || !orderId) return;
+        const fetchEverything = async () => {
+            if (!orderId || orderId.includes(":")) return;
+            setLoading(true);
+            try {
+                const {data, error} = await supabase
+                    .from('orders')
+                    .select('*, scenarios (*)')
+                    .eq('id', orderId)
+                    .single();
 
-            const {data, error} = await supabase
-                .from('orders')
-                .select(`*, location_coords::text, scenarios(title, description, price)`)
-                .eq('id', orderId)
-                .single();
-
-            if (error || !data) {
-                toast.error("Замовлення не знайдено");
-                navigate('/MyOrders');
-                return;
-            }
-
-            if (data.customer_id !== user.id) {
-                toast.error("Ви не можете редагувати це замовлення");
-                navigate('/MyOrders');
-                return;
-            }
-
-            // Заповнюємо поля
-            setTitle(data.scenarios?.title || "");
-            setDescription(data.scenarios?.description || "");
-            setScenarioId(data.scenario_id);
-
-            if (data.execution_time) {
-                const dt = new Date(data.execution_time);
-                setDate(dt.toISOString().split('T')[0]);
-                setTime(dt.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}));
-            }
-
-            // Парсинг координат
-            if (data.location_coords) {
-                const match = data.location_coords.match(/POINT\(([^ ]+) ([^ ]+)\)/);
-                if (match) {
-                    const lng = parseFloat(match[1]);
-                    const lat = parseFloat(match[2]);
-
-                    // Встановлюємо і поточні, і оригінальні координати
-                    setCoords({lat, lng});
-                    setOriginalCoords({lat, lng});
+                if (error) throw error;
+                if (data) {
+                    setOrderData(data);
+                    setTitle(data.scenarios?.title || "");
+                    setDescription(data.scenarios?.description || "");
+                    setPrice(data.scenarios?.price || 0);
                 }
+            } catch (err: any) {
+                toast.error("Замовлення не знайдено");
+            } finally {
+                setLoading(false);
             }
-
-            setReadOnlyInfo({
-                price: data.scenarios?.price || 0,
-                status: data.status,
-                execution_time: data.execution_time
-            });
-
-            setLoading(false);
         };
-
-        fetchOrder();
-    }, [orderId, user, navigate]);
-
-    // Таймер
-    useEffect(() => {
-        if (!readOnlyInfo.execution_time) return;
-
-        const interval = setInterval(() => {
-            const now = new Date().getTime();
-            const target = new Date(readOnlyInfo.execution_time).getTime();
-            const dist = target - now;
-
-            if (dist < 0) {
-                setTimeLeft("Час вийшов");
-            } else {
-                const days = Math.floor(dist / (1000 * 60 * 60 * 24));
-                const hours = Math.floor((dist % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-                const minutes = Math.floor((dist % (1000 * 60 * 60)) / (1000 * 60));
-
-                if (days > 0) setTimeLeft(`${days}д ${hours}г ${minutes}хв`);
-                else setTimeLeft(`${hours}г ${minutes}хв`);
-            }
-        }, 1000);
-
-        return () => clearInterval(interval);
-    }, [readOnlyInfo.execution_time]);
-
-
-    const handleMapClick = (e: any) => {
-        const {lng, lat} = e.lngLat;
-        setCoords({lat, lng});
-    };
+        fetchEverything();
+    }, [orderId]);
 
     const handleSave = async () => {
-        if (!date || !time || !title || !description) {
-            toast.error("Заповніть всі поля");
-            return;
-        }
+        if (!orderData?.scenario_id) return;
         setSaving(true);
-
         try {
-            const newExecutionTime = new Date(`${date}T${time}`).toISOString();
+            const {error} = await supabase
+                .from('scenarios')
+                .update({title, description, price})
+                .eq('id', orderData.scenario_id);
 
-            await supabase.from('scenarios').update({title, description}).eq('id', scenarioId);
-
-            const updates: any = {
-                execution_time: newExecutionTime
-            };
-
-            if (coords) {
-                updates.location_coords = `POINT(${coords.lng} ${coords.lat})`;
-            }
-
-            const {error: ordError} = await supabase
-                .from('orders')
-                .update(updates)
-                .eq('id', orderId);
-
-            if (ordError) throw ordError;
-
-            toast.success("✅ Замовлення оновлено!");
-            setReadOnlyInfo(prev => ({...prev, execution_time: newExecutionTime}));
-
-            // Оновлюємо "оригінальну" точку на нову збережену
-            if (coords) setOriginalCoords(coords);
-
-            navigate('/MyOrders');
-
-        } catch (e: any) {
-            toast.error("Помилка: " + e.message);
+            if (error) throw error;
+            toast.success("Дані оновлено!");
+            navigate(-1);
+        } catch (err: any) {
+            toast.error("Помилка збереження");
         } finally {
             setSaving(false);
         }
     };
 
-    const getStatusLabel = (status: string) => {
-        switch (status) {
-            case 'pending':
-                return {text: "Очікує виконавця", color: "bg-yellow-100 text-yellow-700"};
-            case 'paid_pending_execution':
-                return {text: "Оплачено, очікує", color: "bg-purple-100 text-purple-700"};
-            case 'in_progress':
-                return {text: "В роботі", color: "bg-blue-100 text-blue-700"};
-            case 'completed_pending_approval':
-                return {text: "На перевірці", color: "bg-orange-100 text-orange-700"};
-            case 'completed':
-                return {text: "Виконано", color: "bg-green-100 text-green-700"};
-            case 'expired':
-                return {text: "Прострочено", color: "bg-red-100 text-red-700"};
-            case 'cancelled':
-                return {text: "Скасовано", color: "bg-gray-200 text-gray-600"};
-            default:
-                return {text: status, color: "bg-gray-100"};
-        }
-    };
+    if (loading) return <div className="p-20 text-center font-black text-gray-300">ЗАВАНТАЖЕННЯ...</div>;
 
-    if (loading) return <div className="p-10 text-center">Завантаження...</div>;
-
-    const statusInfo = getStatusLabel(readOnlyInfo.status);
+    const date = new Date(orderData.execution_time);
 
     return (
-        <div className="min-h-screen bg-gray-50 pb-20 relative">
+        <div className="min-h-screen bg-[#f5f5f7] flex justify-center items-center p-4">
+            <div className="bg-white w-full max-w-[600px] rounded-[45px] p-10 md:p-14 shadow-lg">
 
-            {/* Хедер */}
-            <div className="bg-white px-6 py-6 shadow-sm sticky top-0 z-10 flex justify-between items-center">
-                <button onClick={() => navigate(-1)} className="text-gray-500 hover:text-black transition">← Назад
-                </button>
-                <h1 className="text-xl font-bold">Редагування</h1>
-                <div className="w-8"></div>
+                <div className="mb-6">
+                    <h2 className="font-serif text-[20px] font-bold mb-2">Назва сценарію</h2>
+                    <input
+                        type="text"
+                        className="w-full border border-gray-100 rounded-full px-6 py-3 text-lg font-bold outline-none bg-gray-50/50 focus:border-pink-200"
+                        value={title}
+                        onChange={(e) => setTitle(e.target.value)}
+                    />
+                </div>
+
+                <div className="mb-8">
+                    <h2 className="font-serif text-[20px] font-bold mb-2">Опис сценарію</h2>
+                    <textarea
+                        className="w-full h-40 border border-gray-100 rounded-[30px] p-6 text-lg outline-none resize-none italic text-gray-600 bg-[#fcfcfc]"
+                        value={description}
+                        onChange={(e) => setDescription(e.target.value)}
+                    />
+                </div>
+
+                <div className="flex gap-12 mb-10">
+                    <div>
+                        <p className="text-[10px] uppercase font-black text-gray-400 mb-1">Дата на виконання</p>
+                        <p className="font-serif text-2xl font-bold">{date.toLocaleDateString('uk-UA')}</p>
+                    </div>
+                    <div>
+                        <p className="text-[10px] uppercase font-black text-gray-400 mb-1">Час на виконання</p>
+                        <p className="font-serif text-2xl font-bold">{date.toLocaleTimeString('uk-UA', {
+                            hour: '2-digit',
+                            minute: '2-digit'
+                        })}</p>
+                    </div>
+                </div>
+
+                <div className="text-center mb-10">
+                    <h2 className="font-serif text-[20px] font-bold mb-4">Сума винагороди</h2>
+                    <div
+                        className="inline-flex items-center gap-3 bg-white border border-gray-100 px-10 py-4 rounded-full shadow-sm">
+                        <input
+                            type="number"
+                            className="text-4xl font-black w-24 text-center outline-none bg-transparent"
+                            value={price}
+                            onChange={(e) => setPrice(Number(e.target.value))}
+                        />
+                        <span className="text-xl font-bold text-gray-400">USDT</span>
+                    </div>
+                </div>
+
+                <div className="flex flex-col gap-4">
+                    <button
+                        onClick={handleSave}
+                        disabled={saving}
+                        className="w-full py-5 bg-[#ffcbd5] hover:bg-[#ffb6c5] rounded-full font-black text-lg text-gray-800 transition-all active:scale-95 shadow-sm"
+                    >
+                        {saving ? "ЗБЕРЕЖЕННЯ..." : "🤝 ПОГОДИТИ ЗМІНИ"}
+                    </button>
+                    <button onClick={() => navigate(-1)}
+                            className="w-full py-5 bg-gray-100 rounded-full font-black text-gray-500">СКАСУВАТИ
+                    </button>
+                </div>
             </div>
-
-            <main className="max-w-2xl mx-auto p-6 space-y-6">
-
-                {/* Інформація (Read-Only) */}
-                <div
-                    className="bg-white p-6 rounded-3xl border border-white shadow-[0_0_20px_-5px_#ffcdd6] flex flex-col gap-4 relative overflow-hidden">
-                    <div
-                        className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-pink-300 to-purple-300"></div>
-                    <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-1">Інформація про
-                        замовлення</h3>
-                    <div className="grid grid-cols-2 gap-4">
-                        <div className="bg-gray-50 p-3 rounded-2xl border border-gray-100">
-                            <span className="text-xs text-gray-500 block mb-1">Сума</span>
-                            <span
-                                className={`text-lg font-bold ${readOnlyInfo.price > 0 ? "text-green-600" : "text-pink-500"}`}>
-                                {readOnlyInfo.price > 0 ? `${readOnlyInfo.price} USDT` : "Безкоштовно"}
-                            </span>
-                        </div>
-                        <div className="bg-gray-50 p-3 rounded-2xl border border-gray-100">
-                            <span className="text-xs text-gray-500 block mb-1">Таймер</span>
-                            <span className="text-lg font-mono font-bold text-gray-800">{timeLeft}</span>
-                        </div>
-                    </div>
-                    <div
-                        className="flex items-center justify-between bg-gray-50 p-3 rounded-2xl border border-gray-100">
-                        <span className="text-xs text-gray-500">Статус:</span>
-                        <span
-                            className={`px-3 py-1 rounded-lg text-xs font-bold ${statusInfo.color}`}>{statusInfo.text}</span>
-                    </div>
-                    <div className="text-[10px] text-gray-400 text-center mt-1">🔒 Ці дані не підлягають зміні</div>
-                </div>
-
-                {/* Форма */}
-                <div className="bg-white p-6 rounded-3xl border border-white shadow-[0_0_20px_-5px_#ffcdd6] space-y-4">
-                    <div className="flex items-center gap-2 mb-2">
-                        <span className="text-xl">✏️</span>
-                        <h3 className="font-bold text-gray-800">Змінити деталі</h3>
-                    </div>
-                    <div className="space-y-1">
-                        <label className="text-xs font-bold text-gray-400 uppercase ml-1">Назва</label>
-                        <input value={title} onChange={e => setTitle(e.target.value)}
-                               className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-100 focus:outline-none focus:border-[#ffcdd6] transition-all"/>
-                    </div>
-                    <div className="space-y-1">
-                        <label className="text-xs font-bold text-gray-400 uppercase ml-1">Опис</label>
-                        <textarea value={description} onChange={e => setDescription(e.target.value)} rows={4}
-                                  className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-100 focus:outline-none focus:border-[#ffcdd6] transition-all resize-none"/>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-1">
-                            <label className="text-xs font-bold text-gray-400 uppercase ml-1">Дата</label>
-                            <input type="date" value={date} onChange={e => setDate(e.target.value)}
-                                   className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-100 focus:outline-none focus:border-[#ffcdd6]"/>
-                        </div>
-                        <div className="space-y-1">
-                            <label className="text-xs font-bold text-gray-400 uppercase ml-1">Час</label>
-                            <input type="time" value={time} onChange={e => setTime(e.target.value)}
-                                   className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-100 focus:outline-none focus:border-[#ffcdd6]"/>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Карта */}
-                <div className="bg-white p-2 rounded-3xl border border-white shadow-[0_0_20px_-5px_#ffcdd6] space-y-2">
-                    <div className="px-4 pt-2 text-xs font-bold text-gray-400 uppercase">
-                        Змінити місце (клікніть на карті)
-                    </div>
-                    <div className="h-64 w-full rounded-2xl overflow-hidden relative">
-                        <Map
-                            ref={mapRef}
-                            mapboxAccessToken={MAPBOX_TOKEN}
-                            initialViewState={{
-                                latitude: coords?.lat || 50.45,
-                                longitude: coords?.lng || 30.52,
-                                zoom: 13
-                            }}
-                            style={{width: "100%", height: "100%"}}
-                            mapStyle="mapbox://styles/buymybihavior/cmhl1ri9c004201sj1aaa81q9"
-                            onClick={handleMapClick}
-                            cursor="crosshair"
-                        >
-                            <NavigationControl/>
-
-                            {/* 1. СТАРА ТОЧКА (Сіра, напівпрозора) */}
-                            {originalCoords && (
-                                <Marker
-                                    longitude={originalCoords.lng}
-                                    latitude={originalCoords.lat}
-                                    anchor="bottom"
-                                >
-                                    <div className="flex flex-col items-center opacity-50 grayscale filter">
-                                        <span
-                                            className="bg-gray-500 text-white text-[8px] px-1 rounded shadow">Було</span>
-                                        <div className="text-2xl">📍</div>
-                                    </div>
-                                </Marker>
-                            )}
-
-                            {/* 2. НОВА ТОЧКА (Червона, активна) */}
-                            {coords && (
-                                <Marker
-                                    longitude={coords.lng}
-                                    latitude={coords.lat}
-                                    anchor="bottom"
-                                    color="#ff4081"
-                                >
-                                    {/* Можна додати анімацію стрибка для нової точки */}
-                                    <div className="animate-bounce">
-                                        <svg height="30px" viewBox="0 0 24 24" width="30px" fill="#ff4081">
-                                            <path
-                                                d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
-                                        </svg>
-                                    </div>
-                                </Marker>
-                            )}
-                        </Map>
-                    </div>
-
-                    {/* Легенда та статус */}
-                    <div className="flex justify-between items-center px-2">
-                        <div className="flex gap-3 text-[10px] text-gray-500">
-                            <div className="flex items-center gap-1">
-                                <div className="w-2 h-2 bg-gray-400 rounded-full opacity-50"></div>
-                                Минула
-                            </div>
-                            <div className="flex items-center gap-1">
-                                <div className="w-2 h-2 bg-[#ff4081] rounded-full"></div>
-                                Нова
-                            </div>
-                        </div>
-                        {coords && (
-                            <div className="text-xs text-green-600 font-bold">
-                                Точку змінено!
-                            </div>
-                        )}
-                    </div>
-                </div>
-
-                {/* Кнопка Зберегти */}
-                <button
-                    onClick={handleSave}
-                    disabled={saving}
-                    className="w-full bg-[#ffcdd6] text-[#0e0e0e] px-3 py-3 border border-[rgba(0,0,0,0.06)] rounded-full font-bold cursor-pointer shadow-md hover:brightness-95 transition-all"
-                >
-                    {saving ? "Збереження..." : "Зберегти зміни"}
-                </button>
-
-            </main>
         </div>
     );
 }

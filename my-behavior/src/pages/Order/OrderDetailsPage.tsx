@@ -1,473 +1,314 @@
-import React, {useState, useEffect, useRef} from "react";
-import {useLocation, useNavigate, useParams} from "react-router-dom";
-import Map, {Marker, Source, Layer, NavigationControl, MapRef} from "react-map-gl/mapbox";
+import React, {useState, useEffect, useRef, useMemo} from "react";
+import {useParams, useNavigate} from "react-router-dom";
+import Map, {Marker, Source, Layer, MapRef} from "react-map-gl/mapbox";
 import "mapbox-gl/dist/mapbox-gl.css";
+import {motion, AnimatePresence} from "framer-motion";
 import {supabase} from "../../lib/supabaseClient";
 import {useAuth} from "../../context/AuthProvider";
-import {toast} from 'react-toastify';
-// import OrderChat from "../components/OrderChat";
 
 const MAPBOX_TOKEN = "pk.eyJ1IjoiYnV5bXliaWhhdmlvciIsImEiOiJjbWM4MzU3cDQxZGJ0MnFzM3NnOHhnaWM4In0.wShhGG9EvmIVxcHjBHImXw";
 
-// Стилі ліній
-const walkingLayer: any = {
-    id: 'route-walking',
-    type: 'line',
-    layout: {'line-join': 'round', 'line-cap': 'round'},
-    paint: {'line-color': '#007bff', 'line-width': 5, 'line-opacity': 0.8, 'line-dasharray': [1, 2]}
-};
-
-const drivingLayer: any = {
-    id: 'route-driving',
-    type: 'line',
-    layout: {'line-join': 'round', 'line-cap': 'round'},
-    paint: {'line-color': '#ff4081', 'line-width': 6, 'line-opacity': 0.8}
-};
+// Інтерфейс для маршруту з підтримкою GeoJSON стандартів
+interface RouteFeature {
+    type: "Feature";
+    properties: {
+        index: number;
+        duration: number;
+        distance: number;
+    };
+    geometry: any;
+}
 
 export default function OrderDetailsPage() {
-    const {user} = useAuth();
-    const navigate = useNavigate();
     const {orderId} = useParams();
-    const location = useLocation();
+    const navigate = useNavigate();
+    const {user} = useAuth();
     const mapRef = useRef<MapRef>(null);
 
-    const [request, setRequest] = useState<any>(location.state?.request || null);
-    const [loading, setLoading] = useState(!location.state?.request);
-    const [loadingAction, setLoadingAction] = useState(false);
+    // Стан даних
+    const [order, setOrder] = useState<any>(null);
+    const [loading, setLoading] = useState(true);
 
-    // Навігація
-    const [transportMode, setTransportMode] = useState<'walking' | 'driving' | 'cycling'>('walking');
-    const [routeGeoJSON, setRouteGeoJSON] = useState<any>(null);
-    const [routeInfo, setRouteInfo] = useState<{ duration: number, distance: number } | null>(null);
+    // Локації
     const [myCoords, setMyCoords] = useState<{ lat: number, lng: number } | null>(null);
+    const [manualStart, setManualStart] = useState<{ lat: number, lng: number, address: string } | null>(null);
 
-    // Пошук
+    // Пошук та маршрути
     const [searchQuery, setSearchQuery] = useState("");
     const [suggestions, setSuggestions] = useState<any[]>([]);
-    const [isSearching, setIsSearching] = useState(false);
+    const [routes, setRoutes] = useState<RouteFeature[]>([]);
+    const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
 
-    // Інше
-    const [timeLeft, setTimeLeft] = useState<string>("");
-    const [isChatOpen, setIsChatOpen] = useState(false);
+    // Навігація
+    const [isStarted, setIsStarted] = useState(false);
+    const [speed, setSpeed] = useState<number>(0);
+    const [transportMode, setTransportMode] = useState<'walking' | 'driving'>('walking');
+    const [mapStyle, setMapStyle] = useState("mapbox://styles/mapbox/light-v11");
 
-    // 1. ЗАВАНТАЖЕННЯ ДАНИХ
+    // 1. Авто-тема залежно від часу
     useEffect(() => {
-        if (!request && orderId) {
-            const fetchOrder = async () => {
-                const {data: orderData, error} = await supabase
-                    .from('orders')
-                    .select(`*, scenarios(title, description, price), profiles!orders_customer_id_fkey(display_name, avatar_url), performer:profiles!orders_performer_id_fkey(display_name, avatar_url)`)
-                    .eq('id', orderId)
-                    .single();
+        const updateTheme = () => {
+            const hour = new Date().getHours();
+            setMapStyle((hour >= 18 || hour < 6) ? "mapbox://styles/mapbox/dark-v11" : "mapbox://styles/mapbox/light-v11");
+        };
+        updateTheme();
+    }, []);
 
-                if (error || !orderData) {
-                    navigate('/my-orders');
-                    return;
-                }
+    // 2. Завантаження замовлення
+    useEffect(() => {
+        const fetchOrder = async () => {
+            if (!orderId) return;
+            const {data} = await supabase.from('orders').select('*').eq('id', orderId).single();
+            if (data) setOrder(data);
+            setLoading(false);
+        };
+        fetchOrder();
+    }, [orderId]);
 
-                const isIAmCustomer = user?.id === orderData.customer_id;
-                const otherUser = isIAmCustomer ? orderData.performer : orderData.profiles;
-
-                setRequest({
-                    ...orderData,
-                    title: orderData.scenarios.title,
-                    description: orderData.scenarios.description,
-                    price: orderData.scenarios.price,
-                    other_name: otherUser?.display_name,
-                    other_avatar: otherUser?.avatar_url,
-                    location_lat: location.state?.request?.location_lat,
-                    location_lng: location.state?.request?.location_lng
-                });
-                setLoading(false);
-            };
-            fetchOrder();
-        }
-    }, [orderId, request, user]);
-
-    // 2. LIVE TRACKING
+    // 3. GPS Навігація
     useEffect(() => {
         if (!navigator.geolocation) return;
         const watchId = navigator.geolocation.watchPosition(
             (pos) => {
-                setMyCoords({lat: pos.coords.latitude, lng: pos.coords.longitude});
+                const {latitude, longitude, speed: gpsSpeed, heading} = pos.coords;
+                setMyCoords({lat: latitude, lng: longitude});
+                setSpeed(gpsSpeed ? Math.round(gpsSpeed * 3.6) : 0);
+
+                if (isStarted && !manualStart && mapRef.current) {
+                    mapRef.current.easeTo({
+                        center: [longitude, latitude],
+                        pitch: 60,
+                        bearing: heading || 0,
+                        zoom: 18,
+                        duration: 1000
+                    });
+                }
             },
-            (err) => console.error("GPS Error:", err),
-            {enableHighAccuracy: true, timeout: 20000, maximumAge: 1000}
+            (err) => console.error(err),
+            {enableHighAccuracy: true}
         );
         return () => navigator.geolocation.clearWatch(watchId);
-    }, []);
+    }, [isStarted, manualStart]);
 
-    // 3. АВТО-ОНОВЛЕННЯ МАРШРУТУ
+    // 4. Пошук точки старту
+    const handleSearch = async (query: string) => {
+        setSearchQuery(query);
+        if (query.length < 3) return setSuggestions([]);
+        const res = await fetch(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${MAPBOX_TOKEN}&limit=5&language=uk`);
+        const data = await res.json();
+        setSuggestions(data.features || []);
+    };
+
+    // 5. Побудова оптимальних маршрутів (ВИПРАВЛЕНО GeoJSON)
     useEffect(() => {
-        if (myCoords && request?.location_lat && request?.location_lng) {
-            buildRoute(myCoords.lng, myCoords.lat, request.location_lng, request.location_lat);
+        const start = manualStart ? {lng: manualStart.lng, lat: manualStart.lat} : myCoords;
+        if (start && order?.location_lat) {
+            const mode = transportMode === 'walking' ? 'walking' : 'driving';
+            fetch(`https://api.mapbox.com/directions/v5/mapbox/${mode}/${start.lng},${start.lat};${order.location_lng},${order.location_lat}?alternatives=true&geometries=geojson&access_token=${MAPBOX_TOKEN}`)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.routes) {
+                        const formatted = data.routes.map((r: any, i: number) => ({
+                            type: "Feature",
+                            properties: {
+                                index: i,
+                                duration: r.duration,
+                                distance: r.distance
+                            },
+                            geometry: r.geometry
+                        }));
+                        setRoutes(formatted);
+                        setSelectedRouteIndex(0);
+                    }
+                });
         }
-    }, [transportMode, myCoords]);
+    }, [myCoords, order, transportMode, manualStart]);
 
-    // 4. ТАЙМЕР
-    useEffect(() => {
-        if (!request || request.status !== 'in_progress') return;
-        const interval = setInterval(() => {
-            const now = new Date().getTime();
-            const target = new Date(request.execution_time).getTime();
-            const dist = target - now;
-            if (dist < 0) {
-                setTimeLeft("00:00:00");
-            } else {
-                const h = Math.floor((dist % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-                const m = Math.floor((dist % (1000 * 60 * 60)) / (1000 * 60));
-                const s = Math.floor((dist % (1000 * 60)) / 1000);
-                setTimeLeft(`${h}г ${m}хв ${s}с`);
-            }
-        }, 1000);
-        return () => clearInterval(interval);
-    }, [request]);
-
-    // --- ФУНКЦІЇ ---
-    const handleSearchInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const val = e.target.value;
-        setSearchQuery(val);
-        if (val.length > 2) {
-            try {
-                const res = await fetch(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(val)}.json?access_token=${MAPBOX_TOKEN}&country=ua&limit=5`);
-                const data = await res.json();
-                setSuggestions(data.features || []);
-            } catch (e) {
-            }
-        } else {
-            setSuggestions([]);
-        }
-    };
-
-    const selectSuggestion = (feature: any) => {
-        const [lng, lat] = feature.center;
-        setMyCoords({lat, lng});
-        setSearchQuery(feature.place_name);
-        setSuggestions([]);
-        setIsSearching(false);
-        mapRef.current?.flyTo({center: [lng, lat], zoom: 14});
-    };
-
-    const buildRoute = async (startLng: number, startLat: number, endLng: number, endLat: number) => {
-        try {
-            const query = await fetch(`https://api.mapbox.com/directions/v5/mapbox/${transportMode}/${startLng},${startLat};${endLng},${endLat}?steps=true&geometries=geojson&access_token=${MAPBOX_TOKEN}`);
-            const json = await query.json();
-            if (!json.routes?.length) return;
-
-            const data = json.routes[0];
-            setRouteGeoJSON({
-                type: 'Feature',
-                properties: {},
-                geometry: {type: 'LineString', coordinates: data.geometry.coordinates}
-            });
-            setRouteInfo({
-                duration: Math.floor(data.duration / 60),
-                distance: parseFloat((data.distance / 1000).toFixed(2))
-            });
-        } catch (e) {
-        }
-    };
-
-    const centerOnMe = () => {
-        if (myCoords) {
-            mapRef.current?.flyTo({center: [myCoords.lng, myCoords.lat], zoom: 15, pitch: 45});
-        } else {
-            toast.info("Шукаємо супутники...");
-        }
-    };
-
-    const openGoogleMaps = () => {
-        if (!request.location_lat) return;
-        const url = `https://www.google.com/maps/dir/?api=1&destination=${request.location_lat},${request.location_lng}&travelmode=transit`;
-        window.open(url, '_blank');
-    };
-
-    // --- ДІЇ ЗАМОВЛЕННЯ ---
-
-    const handleAccept = async () => {
-        setLoadingAction(true);
-        try {
-            const {error} = await supabase
-                .from('orders')
-                .update({status: 'in_progress'})
-                .eq('id', request.order_id || request.id);
-
-            if (error) throw error;
-            toast.success("✅ Замовлення прийнято!");
-            navigate('/MyOrders');
-        } catch (err: any) {
-            toast.error("Помилка: " + err.message);
-        } finally {
-            setLoadingAction(false);
-        }
-    };
-
-    const handleDecline = async () => {
-        if (!confirm("Відхилити це замовлення?")) return;
-        setLoadingAction(true);
-        try {
-            const {error} = await supabase
-                .from('orders')
-                .update({status: 'cancelled'})
-                .eq('id', request.order_id || request.id);
-
-            if (error) throw error;
-            toast.info("Відхилено.");
-            navigate('/GetScenario');
-        } catch (err: any) {
-            toast.error("Помилка: " + err.message);
-        } finally {
-            setLoadingAction(false);
-        }
-    };
-
-    const handleComplete = async () => {
-        if (!confirm("Ви впевнені, що завдання виконано?")) return;
-        setLoadingAction(true);
-        try {
-            const {error} = await supabase
-                .from('orders')
-                .update({status: 'completed'})
-                .eq('id', request.order_id || request.id);
-
-            if (error) throw error;
-            toast.success("🎉 Вітаємо! Завдання завершено.");
-            navigate('/MapPages');
-        } catch (err: any) {
-            toast.error("Помилка: " + err.message);
-        } finally {
-            setLoadingAction(false);
-        }
-    };
-
-    if (loading || !request) return <div className="p-10 text-center">Завантаження...</div>;
-
-    const hasCoords = request.location_lat && request.location_lng;
-
-    // Визначаємо статус для відображення кнопок
-    const isPending = ['pending', 'paid_pending_execution', 'pending_execution'].includes(request.status);
-    const isInProgress = request.status === 'in_progress';
+    if (loading) return <div
+        className="h-screen flex items-center justify-center bg-white font-black animate-pulse uppercase text-gray-400">⚖️
+        Синхронізація маршруту...</div>;
 
     return (
-        <div className="min-h-screen bg-gray-50 relative pb-[140px]">
+        <div className="h-screen w-full relative overflow-hidden bg-white">
 
-            {/* Header + Search */}
-            <div className="absolute top-0 left-0 w-full z-20 px-4 py-4 pointer-events-none">
-                <div
-                    className="bg-white/90 backdrop-blur-md rounded-2xl shadow-[0_10px_40px_-10px_#ffcdd6] border border-white pointer-events-auto">
-                    <div className="flex items-center px-4 py-3 gap-2">
-                        <button onClick={() => navigate(-1)} className="text-gray-500 pr-2 border-r border-gray-200">←
-                        </button>
-                        <div className="flex-1 relative">
+            {/* ПОШУК ЗВЕРХУ */}
+            <AnimatePresence>
+                <motion.div
+                    initial={{y: -100}} animate={{y: 0}}
+                    className="absolute top-6 left-6 right-6 z-[100] flex gap-3"
+                >
+                    <button onClick={() => navigate(-1)}
+                            className="bg-white/95 backdrop-blur-md w-12 h-12 rounded-full shadow-2xl flex items-center justify-center font-bold border border-gray-100 active:scale-90 transition-all">←
+                    </button>
+                    <div className="relative flex-1">
+                        <div
+                            className="bg-white/95 backdrop-blur-md rounded-3xl shadow-2xl flex items-center px-6 h-12 border border-gray-100">
+                            <span className="mr-3 text-lg">📍</span>
                             <input
-                                type="text"
-                                value={searchQuery}
-                                onChange={handleSearchInput}
-                                onFocus={() => setIsSearching(true)}
-                                placeholder="Ваша позиція..."
-                                className="w-full bg-transparent outline-none text-sm font-medium text-gray-800 placeholder-gray-400"
+                                type="text" placeholder={manualStart ? manualStart.address : "Звідки їдемо?"}
+                                value={searchQuery} onChange={(e) => handleSearch(e.target.value)}
+                                className="bg-transparent border-none outline-none w-full text-sm font-black text-gray-800 placeholder:text-gray-300"
                             />
-                            {suggestions.length > 0 && isSearching && (
-                                <ul className="absolute top-10 left-0 w-full bg-white rounded-xl shadow-xl border border-gray-100 overflow-hidden z-50">
-                                    {suggestions.map((s) => (
-                                        <li key={s.id} onClick={() => selectSuggestion(s)}
-                                            className="px-4 py-3 text-xs hover:bg-[#fff0f5] cursor-pointer border-b border-gray-50 last:border-0">
-                                            {s.place_name}
-                                        </li>
-                                    ))}
-                                </ul>
-                            )}
+                            {manualStart && <button onClick={() => {
+                                setManualStart(null);
+                                setSearchQuery("");
+                            }} className="ml-2 text-[9px] font-black text-red-500 uppercase">Скинути</button>}
                         </div>
-                        <button onClick={centerOnMe} className="text-blue-500 animate-pulse">🎯</button>
-                    </div>
-                </div>
-            </div>
 
-            {/* MAP */}
-            <div className="h-[65vh] w-full relative">
-                {hasCoords ? (
-                    <Map
-                        ref={mapRef}
-                        mapboxAccessToken={MAPBOX_TOKEN}
-                        initialViewState={{
-                            latitude: request.location_lat,
-                            longitude: request.location_lng,
-                            zoom: 13
-                        }}
-                        style={{width: "100%", height: "100%"}}
-                        mapStyle="mapbox://styles/buymybihavior/cmhl1ri9c004201sj1aaa81q9"
-                    >
-                        <Marker longitude={request.location_lng} latitude={request.location_lat} anchor="bottom">
-                            <div className="flex flex-col items-center">
-                                <span
-                                    className="bg-black text-white text-[10px] px-2 py-1 rounded-md mb-1 shadow-md">Фініш</span>
-                                <div className="text-3xl">🏁</div>
+                        {suggestions.length > 0 && (
+                            <div
+                                className="absolute top-14 left-0 right-0 bg-white rounded-3xl shadow-2xl overflow-hidden border border-gray-50">
+                                {suggestions.map((s, i) => (
+                                    <button key={i} onClick={() => {
+                                        setManualStart({lat: s.center[1], lng: s.center[0], address: s.place_name});
+                                        setSuggestions([]);
+                                        setSearchQuery(s.place_name);
+                                        mapRef.current?.flyTo({center: s.center, zoom: 15});
+                                    }}
+                                            className="w-full text-left px-6 py-4 hover:bg-gray-50 border-b border-gray-50 flex items-center gap-3">
+                                        <span className="text-xl">🏘️</span>
+                                        <div className="overflow-hidden">
+                                            <p className="text-sm font-black text-gray-800 truncate">{s.text}</p>
+                                            <p className="text-[10px] font-bold text-gray-400 truncate uppercase">{s.place_name}</p>
+                                        </div>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </motion.div>
+            </AnimatePresence>
+
+            <Map
+                ref={mapRef}
+                mapboxAccessToken={MAPBOX_TOKEN}
+                initialViewState={{
+                    latitude: order?.location_lat || 50.45,
+                    longitude: order?.location_lng || 30.52,
+                    zoom: 15
+                }}
+                style={{width: "100%", height: "100%"}}
+                mapStyle={mapStyle}
+            >
+                {/* ВІДОБРАЖЕННЯ МАРШРУТІВ (ВИПРАВЛЕНО properties) */}
+                {routes.map((route, index) => (
+                    <Source key={index} id={`route-${index}`} type="geojson" data={route}>
+                        <Layer
+                            id={`layer-${index}`} type="line"
+                            paint={{
+                                "line-color": index === selectedRouteIndex ? "#FFD700" : "#E5E7EB",
+                                "line-width": index === selectedRouteIndex ? 10 : 6,
+                                "line-opacity": index === selectedRouteIndex ? 1 : 0.5
+                            }}
+                            layout={{"line-cap": "round", "line-join": "round"}}
+                        />
+                    </Source>
+                ))}
+
+                {/* ТОЧКА Б (ФІНІШ) */}
+                <Marker longitude={Number(order?.location_lng)} latitude={Number(order?.location_lat)}>
+                    <div className="text-5xl drop-shadow-2xl">🏁</div>
+                </Marker>
+
+                {/* ВАШ АВАТАР (ТОЧКА А) */}
+                {(() => {
+                    const coords = manualStart || myCoords;
+                    if (!coords) return null;
+                    return (
+                        <Marker longitude={coords.lng} latitude={coords.lat} anchor="center">
+                            <div className="relative">
+                                <div className="absolute -inset-6 bg-blue-500/10 rounded-full animate-ping"></div>
+                                <img
+                                    src={user?.avatar_url || "/logo_for_reg.jpg"}
+                                    className="w-16 h-16 rounded-full border-[5px] border-white shadow-2xl object-cover relative z-10"
+                                />
+                                {manualStart && (
+                                    <div
+                                        className="absolute -top-2 -right-2 bg-black text-white w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-black border-2 border-white z-20 shadow-lg">A</div>
+                                )}
                             </div>
                         </Marker>
+                    );
+                })()}
+            </Map>
 
-                        {myCoords && (
-                            <Marker longitude={myCoords.lng} latitude={myCoords.lat} anchor="center">
-                                <div className="relative">
-                                    <div
-                                        className="w-5 h-5 bg-blue-500 rounded-full border-2 border-white shadow-lg z-10 relative"></div>
-                                    <div
-                                        className="absolute top-0 left-0 w-5 h-5 bg-blue-500 rounded-full animate-ping opacity-50"></div>
-                                </div>
-                            </Marker>
-                        )}
-
-                        {routeGeoJSON && (
-                            <Source id="route-source" type="geojson" data={routeGeoJSON}>
-                                <Layer {...(transportMode === 'walking' ? walkingLayer : drivingLayer)} />
-                            </Source>
-                        )}
-                    </Map>
-                ) : (
-                    <div className="flex items-center justify-center h-full bg-gray-100 text-gray-400">Немає
-                        координат</div>
-                )}
-
-                {/* ПАНЕЛЬ НАВІГАЦІЇ */}
+            {/* ПАНЕЛЬ ВИБОРУ МАРШРУТУ ТА ETA */}
+            <div className="absolute bottom-8 left-4 right-4 z-[90]">
                 <div
-                    className="absolute bottom-4 left-4 right-4 bg-white p-2 rounded-2xl shadow-[0_10px_40px_-10px_#ffcdd6] border border-white flex justify-between items-center gap-2">
-                    <div className="flex bg-gray-100 p-1 rounded-xl">
-                        {['walking', 'driving', 'cycling'].map((mode) => (
-                            <button
-                                key={mode}
-                                onClick={() => setTransportMode(mode as any)}
-                                className={`p-2 rounded-lg transition-all ${transportMode === mode ? 'bg-white shadow-sm text-blue-600' : 'text-gray-400'}`}
-                            >
-                                {mode === 'walking' ? '🚶' : mode === 'driving' ? '🚗' : '🚲'}
-                            </button>
-                        ))}
-                    </div>
-                    {routeInfo ? (
-                        <div className="text-right px-2">
-                            <p className="text-sm font-bold text-gray-800">{routeInfo.duration} хв</p>
-                            <p className="text-[10px] text-gray-500">{routeInfo.distance} км</p>
+                    className="bg-white rounded-[45px] shadow-[0_30px_100px_rgba(0,0,0,0.15)] p-8 border border-white/60">
+
+                    {/* Вибір альтернативного шляху */}
+                    {routes.length > 1 && (
+                        <div className="flex gap-2 mb-8 overflow-x-auto no-scrollbar pb-2">
+                            {routes.map((r, i) => (
+                                <button
+                                    key={i} onClick={() => setSelectedRouteIndex(i)}
+                                    className={`px-6 py-3 rounded-2xl whitespace-nowrap text-[10px] font-black uppercase tracking-widest transition-all shadow-sm ${selectedRouteIndex === i ? 'bg-black text-white scale-105' : 'bg-gray-100 text-gray-400'}`}
+                                >
+                                    Варіант {i + 1} • {Math.floor(r.properties.duration / 60)} хв
+                                </button>
+                            ))}
                         </div>
-                    ) : (
-                        <div className="text-xs text-gray-400 px-2">Маршрут...</div>
-                    )}
-                    <button onClick={openGoogleMaps}
-                            className="bg-blue-50 text-blue-600 p-2.5 rounded-xl text-xs font-bold border border-blue-100">
-                        🚌 Google
-                    </button>
-                </div>
-            </div>
-
-            {/* ДЕТАЛІ */}
-            <div className="px-6 py-6 space-y-6">
-
-                {/* Таймер */}
-                {isInProgress && (
-                    <div
-                        className="bg-black text-white p-5 rounded-3xl text-center shadow-[0_10px_30px_-5px_rgba(0,0,0,0.3)]">
-                        <p className="text-[10px] text-gray-400 uppercase tracking-widest mb-1">До завершення</p>
-                        <div
-                            className="text-3xl font-mono font-bold tracking-wider text-[#ffcdd6]">{timeLeft || "..."}</div>
-                    </div>
-                )}
-
-                <div className="flex justify-between items-center">
-                    <h2 className="font-bold text-2xl text-gray-900">{request.title}</h2>
-                    <span
-                        className={`px-3 py-1 rounded-full text-xs font-bold ${request.status === 'in_progress' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100'}`}>
-                        {request.status === 'in_progress' ? 'В роботі' : request.status}
-                    </span>
-                </div>
-
-                <div className="bg-white p-5 rounded-2xl border border-white shadow-[0_0_20px_#ffcdd6]">
-                    <p className="text-gray-600 text-sm leading-relaxed">{request.description}</p>
-                </div>
-
-                {/* Контакт */}
-                <div
-                    className="flex items-center gap-4 bg-white p-4 rounded-2xl border border-white shadow-[0_0_20px_#ffcdd6]">
-                    <img
-                        src={request.other_avatar || '/logo_for_reg.jpg'}
-                        className="w-12 h-12 rounded-full border-[3px] border-white shadow-[0_0_10px_#ffcdd6] object-cover"
-                    />
-                    <div>
-                        <p className="text-[10px] text-gray-400 uppercase font-bold">Контакт</p>
-                        <p className="font-bold text-gray-800">{request.other_name || "Користувач"}</p>
-                    </div>
-                    <div className="ml-auto font-bold text-green-600 bg-green-50 px-3 py-1 rounded-lg text-xs">
-                        {request.price} USDT
-                    </div>
-                </div>
-            </div>
-
-            {/* --- НИЖНЯ ФІКСОВАНА ПАНЕЛЬ (КНОПКИ) --- */}
-            <div className="fixed bottom-0 left-0 w-full bg-white/90 backdrop-blur border-t border-gray-100 p-4 z-30">
-                <div className="max-w-3xl mx-auto flex gap-3">
-
-                    {/* КНОПКИ ДЛЯ НОВИХ ЗАМОВЛЕНЬ (Pending) */}
-                    {isPending && (
-                        <>
-                            <button
-                                onClick={handleDecline}
-                                disabled={loadingAction}
-                                className="w-full bg-[#ffcdd6] text-[#0e0e0e] px-3 py-3 border border-[rgba(0,0,0,0.06)] rounded-full font-bold cursor-pointer shadow-md hover:brightness-95 transition-all"
-                            >
-                                Відхилити
-                            </button>
-                            <button
-                                onClick={handleAccept}
-                                disabled={loadingAction}
-                                className="w-full bg-[#ffcdd6] text-[#0e0e0e] px-3 py-3 border border-[rgba(0,0,0,0.06)] rounded-full font-bold cursor-pointer shadow-md hover:brightness-95 transition-all"
-                            >
-                                {loadingAction ? "..." : "Прийняти"}
-                            </button>
-                        </>
                     )}
 
-                    {/* КНОПКИ ДЛЯ ЗАМОВЛЕНЬ В РОБОТІ (In Progress) */}
-                    {isInProgress && (
-                        <>
-                            <button
-                                onClick={() => setIsChatOpen(true)}
-                                className="flex-1 py-3 bg-white text-black border border-gray-200 rounded-xl font-bold shadow-sm"
-                            >
-                                Чат
+                    <div className="flex justify-between items-end mb-8">
+                        <div>
+                            <p className="text-[10px] font-black uppercase text-gray-300 tracking-[0.3em] mb-2">{manualStart ? "Прогноз з Точки А" : "Навігація GPS"}</p>
+                            <h2 className="text-5xl font-black text-gray-900 leading-none tracking-tighter">
+                                {routes[selectedRouteIndex] ? `${Math.floor(routes[selectedRouteIndex].properties.duration / 60)} хв` : '--'}
+                            </h2>
+                            <p className="text-sm font-bold text-blue-500 mt-2">
+                                {routes[selectedRouteIndex] ? `${(routes[selectedRouteIndex].properties.distance / 1000).toFixed(1)} км` : 'Розрахунок...'}
+                            </p>
+                        </div>
+                        <div className="flex bg-gray-50 p-2 rounded-3xl gap-1 border border-gray-100 shadow-inner">
+                            <button onClick={() => setTransportMode('walking')}
+                                    className={`p-4 rounded-2xl transition-all ${transportMode === 'walking' ? 'bg-white shadow-md text-blue-600' : 'text-gray-300'}`}>🚶
                             </button>
-                            <button
-                                onClick={handleComplete}
-                                disabled={loadingAction}
-                                className="flex-[2] py-3 bg-[#ffcdd6] text-[#0e0e0e] rounded-xl font-bold hover:bg-[rgba(0,0,0,0.06)] transition-colors shadow-md hover:brightness-95"
-                            >
-                                {loadingAction ? "..." : "✅ Завершити"}
+                            <button onClick={() => setTransportMode('driving')}
+                                    className={`p-4 rounded-2xl transition-all ${transportMode === 'driving' ? 'bg-white shadow-md text-blue-600' : 'text-gray-300'}`}>🚗
                             </button>
-                        </>
-                    )}
+                        </div>
+                    </div>
 
-                    {/* Якщо виконано або скасовано - кнопка "Назад" */}
-                    {!isPending && !isInProgress && (
-                        <button
-                            onClick={() => navigate(-1)}
-                            className="w-full py-3 bg-gray-100 text-gray-600 rounded-xl font-bold"
-                        >
-                            Назад
+                    {!isStarted ? (
+                        <button onClick={() => setIsStarted(true)}
+                                className="w-full py-6 bg-[#ffcbd5] hover:bg-[#ffb6c5] text-gray-900 rounded-full font-black text-xl shadow-xl active:scale-95 transition-all uppercase tracking-widest">
+                            {transportMode === 'walking' ? '👟 Пішли' : '🚀 Поїхали'}
                         </button>
+                    ) : (
+                        <div className="flex gap-4">
+                            <button
+                                onClick={() => {
+                                    const r = routes[selectedRouteIndex];
+                                    const start = manualStart || myCoords;
+                                    window.open(`http://googleusercontent.com/maps.google.com/maps?saddr=${start?.lat},${start?.lng}&daddr=${order.location_lat},${order.location_lng}&directionsmode=${transportMode}`, "_blank");
+                                }}
+                                className="flex-1 py-5 bg-blue-50 text-blue-600 rounded-full font-black text-xs uppercase border border-blue-100 shadow-sm"
+                            >
+                                Google Maps
+                            </button>
+                            <button onClick={() => {
+                                setIsStarted(false);
+                                mapRef.current?.flyTo({pitch: 0, zoom: 15});
+                            }}
+                                    className="px-12 py-5 bg-black text-white rounded-full font-black text-xs uppercase shadow-xl">Стоп
+                            </button>
+                        </div>
                     )}
                 </div>
             </div>
 
-            {/*/!* ЧАТ МОДАЛКА *!/*/}
-            {/*{isChatOpen && (*/}
-            {/*    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end sm:items-center justify-center">*/}
-            {/*        <div className="bg-white w-full sm:max-w-md h-[80vh] sm:h-[600px] rounded-t-3xl sm:rounded-3xl flex flex-col overflow-hidden shadow-2xl relative">*/}
-            {/*            <div className="p-4 border-b flex justify-between items-center bg-gray-50">*/}
-            {/*                <h3 className="font-bold">Чат замовлення</h3>*/}
-            {/*                <button onClick={() => setIsChatOpen(false)} className="text-gray-500 text-xl">✕</button>*/}
-            {/*            </div>*/}
-            {/*            <div className="flex-1 overflow-hidden">*/}
-            {/*                <OrderChat orderId={request.order_id || request.id} />*/}
-            {/*            </div>*/}
-            {/*        </div>*/}
-            {/*    </div>*/}
-            {/*)}*/}
-
+            {/* СПІДОМЕТР */}
+            {isStarted && !manualStart && (
+                <div className="absolute top-[140px] right-6 z-[60]">
+                    <motion.div initial={{scale: 0}} animate={{scale: 1}}
+                                className="w-24 h-24 bg-white rounded-full border-[5px] border-red-500 shadow-2xl flex flex-col items-center justify-center">
+                        <span className="text-3xl font-black text-gray-900 leading-none">{speed}</span>
+                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-tighter">км/г</span>
+                    </motion.div>
+                </div>
+            )}
         </div>
     );
 }

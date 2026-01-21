@@ -1,175 +1,235 @@
-import React, {useState, useEffect} from "react";
-import {useNavigate, useParams} from "react-router-dom";
+import React, {useState, useEffect, useRef} from "react";
+import {useParams, useNavigate} from "react-router-dom";
 import {supabase} from "../../lib/supabaseClient";
-import {useAuth} from "../../context/AuthProvider";
-import {toast} from 'react-toastify';
+import {motion, AnimatePresence} from "framer-motion";
+import {toast} from "react-toastify";
+import Nav_bar from "../../Nav_bar";
 
 export default function DisputePage() {
     const {orderId} = useParams();
-    const {user} = useAuth();
     const navigate = useNavigate();
-
-    const [order, setOrder] = useState<any>(null);
-    const [votes, setVotes] = useState({performer: 0, customer: 0});
-    const [myVote, setMyVote] = useState<string | null>(null);
-    const [timeLeft, setTimeLeft] = useState("");
+    const [disputes, setDisputes] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
 
-    const WIN_THRESHOLD = 248;
-    const DISPUTE_HOURS = 72;
+    // 1. Завантаження даних
+    useEffect(() => {
+        const fetchDisputes = async () => {
+            setLoading(true);
+            try {
+                const {data, error} = await supabase
+                    .from('orders')
+                    .select(`
+                        id, status, proof_description, proof_url, votes_for, votes_against, disputed_at,
+                        customer_id, performer_id,
+                        customer:profiles!customer_id(id, display_name, avatar_url),
+                        performer:profiles!performer_id(id, display_name, avatar_url),
+                        scenarios (id, title, description, price, location_lat, location_lng)
+                    `)
+                    .eq('status', 'disputed');
+
+                if (error) throw error;
+
+                if (data && data.length > 0) {
+                    // Сортуємо, щоб поточний ID був першим
+                    const sorted = [...data].sort((a, b) => a.id === Number(orderId) ? -1 : 1);
+                    setDisputes(sorted);
+                } else {
+                    // Якщо замовлення не в статусі 'disputed', перекидаємо на помилку
+                    navigate('/dispute/not-found');
+                }
+            } catch (err: any) {
+                console.error("Помилка завантаження:", err);
+                navigate('/dispute/not-found');
+            } finally {
+                setLoading(false);
+            }
+        };
+        fetchDisputes();
+    }, [orderId, navigate]);
+
+    // 2. Realtime оновлення
+    useEffect(() => {
+        const channel = supabase
+            .channel('dispute-realtime')
+            .on('postgres_changes', {event: 'UPDATE', schema: 'public', table: 'orders'}, (payload) => {
+                setDisputes(prev => prev.map(d => d.id === payload.new.id ? {...d, ...payload.new} : d));
+            })
+            .subscribe();
+        return () => {
+            supabase.removeChannel(channel);
+        };
+    }, []);
+
+    if (loading) return (
+        <div
+            className="h-screen bg-white flex items-center justify-center font-black uppercase text-gray-300 animate-pulse">
+            ⚖️ СИНХРОНІЗАЦІЯ...
+        </div>
+    );
+
+    // ЗАХИСТ: якщо після завантаження масив порожній
+    if (disputes.length === 0) return null;
+
+    return (
+        <div className="h-screen w-full bg-white flex flex-col overflow-hidden relative">
+            
+
+            {/* Стрілка Назад */}
+            <motion.button
+                initial={{opacity: 0, x: -20}}
+                animate={{opacity: 1, x: 0}}
+                onClick={() => navigate('/MapPages')}
+                className="fixed top-24 left-8 z-[60] flex items-center gap-3 bg-white/90 backdrop-blur-md p-4 rounded-2xl shadow-xl hover:bg-black hover:text-white transition-all border border-gray-100"
+            >
+                <span className="text-xl">←</span>
+                <span className="font-black text-[10px] uppercase tracking-widest">Назад до карти</span>
+            </motion.button>
+
+            <div className="flex-1 overflow-y-scroll snap-y snap-mandatory no-scrollbar">
+                <AnimatePresence>
+                    {disputes.map((d) => (
+                        <DisputeSection key={d.id} d={d}/>
+                    ))}
+                </AnimatePresence>
+            </div>
+        </div>
+    );
+}
+
+function DisputeSection({d}: { d: any }) {
+    const navigate = useNavigate();
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const [isPlaying, setIsPlaying] = useState(true);
+    const [timeLeft, setTimeLeft] = useState("");
+
+    // КРИТИЧНЕ ВИПРАВЛЕННЯ: перевірка на null перед викликом getPublicUrl
+    const videoUrl = d?.proof_url
+        ? supabase.storage.from('order-proofs').getPublicUrl(d.proof_url).data.publicUrl
+        : null;
 
     useEffect(() => {
-        fetchDisputeData();
-        const interval = setInterval(fetchDisputeData, 10000);
-        return () => clearInterval(interval);
-    }, [orderId]);
-
-    // Timer
-    useEffect(() => {
-        if (!order?.dispute_started_at) return;
         const timer = setInterval(() => {
-            const start = new Date(order.dispute_started_at).getTime();
-            const end = start + (DISPUTE_HOURS * 60 * 60 * 1000);
-            const now = new Date().getTime();
-            const diff = end - now;
+            if (!d.disputed_at) return setTimeLeft("—");
+            const diff = new Date(d.disputed_at).getTime() + (24 * 60 * 60 * 1000) - Date.now();
             if (diff <= 0) {
-                setTimeLeft("00:00:00");
-                // auto-resolve logic could go here
+                setTimeLeft("ЧАС ВИЙШОВ");
             } else {
-                const h = Math.floor(diff / (1000 * 60 * 60));
-                const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-                setTimeLeft(`${h}г ${m}хв`);
+                const h = Math.floor(diff / 3600000);
+                const m = Math.floor((diff % 3600000) / 60000);
+                const s = Math.floor((diff % 60000) / 1000);
+                setTimeLeft(`${h}г ${m}м ${s}с`);
             }
         }, 1000);
         return () => clearInterval(timer);
-    }, [order]);
+    }, [d.disputed_at]);
 
-    const fetchDisputeData = async () => {
-        if (!orderId) return;
-
-        const {data: ord} = await supabase
-            .from('orders')
-            .select(`*, scenarios(title, price), performer:profiles!orders_performer_id_fkey(display_name), customer:profiles!orders_customer_id_fkey(display_name)`)
-            .eq('id', orderId)
-            .single();
-        if (ord) setOrder(ord);
-
-        const {data: vs} = await supabase.from('dispute_votes').select('*').eq('order_id', orderId);
-        if (vs) {
-            const perfVotes = vs.filter(v => v.vote_side === 'performer').length;
-            const custVotes = vs.filter(v => v.vote_side === 'customer').length;
-            setVotes({performer: perfVotes, customer: custVotes});
-
-            if (user) {
-                const mine = vs.find(v => v.voter_id === user.id);
-                if (mine) setMyVote(mine.vote_side);
-            }
-        }
-        setLoading(false);
+    const onVote = async (id: number, type: 'for' | 'against') => {
+        const column = type === 'for' ? 'votes_for' : 'votes_against';
+        const {error} = await supabase.rpc('increment_vote', {row_id: id, column_name: column});
+        if (error) toast.error("Помилка голосування");
+        else toast.success("Голос прийнято!");
     };
-
-    const handleVote = async (side: 'performer' | 'customer') => {
-        if (!user) return toast.error("Авторизуйтесь");
-        if (myVote) return toast.info("Ви вже голосували");
-
-        const {error} = await supabase.from('dispute_votes').insert({
-            order_id: orderId,
-            voter_id: user.id,
-            vote_side: side
-        });
-
-        if (error) toast.error(error.message);
-        else {
-            toast.success("Ваш голос враховано!");
-            setMyVote(side);
-            fetchDisputeData();
-        }
-    };
-
-    if (loading || !order) return <div className="p-10 text-center">Завантаження...</div>;
-
-    const totalVotes = votes.performer + votes.customer;
-    const perfPercent = totalVotes === 0 ? 50 : (votes.performer / totalVotes) * 100;
 
     return (
-        <div className="min-h-screen bg-gray-50 pb-10">
-            {/* Header */}
-            <div className="bg-white px-6 py-6 shadow-sm sticky top-0 z-10 flex items-center gap-3">
-                <button onClick={() => navigate(-1)} className="text-gray-500 hover:text-black">←</button>
-                <h1 className="text-xl font-bold">Спірне замовлення</h1>
-            </div>
-
-            <div className="p-6 space-y-6 max-w-2xl mx-auto">
-                {/* Timer Banner */}
-                <div
-                    className="bg-black text-white p-6 rounded-3xl text-center shadow-[0_10px_30px_-5px_rgba(0,0,0,0.5)]">
-                    <p className="text-gray-400 text-xs uppercase mb-1 tracking-widest">До завершення голосування</p>
-                    <div className="text-4xl font-mono font-bold text-[#ffcdd6]">{timeLeft}</div>
-                </div>
-
-                {/* Progress Bar */}
-                <div className="bg-white p-6 rounded-3xl shadow-[0_0_20px_-5px_#ffcdd6] border border-white">
-                    <div className="flex justify-between text-sm font-bold mb-3">
-                        <span className="text-green-600">За Виконавця ({votes.performer})</span>
-                        <span className="text-red-500">Проти ({votes.customer})</span>
-                    </div>
-                    <div className="h-6 w-full bg-red-100 rounded-full overflow-hidden flex relative">
-                        <div
-                            className="bg-green-500 h-full transition-all duration-500 flex items-center justify-end px-2"
-                            style={{width: `${perfPercent}%`}}
-                        >
-                            <span className="text-[10px] text-white font-bold">{Math.round(perfPercent)}%</span>
-                        </div>
-                    </div>
-                    <p className="text-center text-xs text-gray-400 mt-3">Потрібно {WIN_THRESHOLD} голосів для
-                        перемоги</p>
-                </div>
-
-                {/* Proof Details */}
-                <div className="bg-white p-5 rounded-3xl border border-white shadow-[0_0_20px_-5px_#ffcdd6]">
-                    <h2 className="font-bold text-xl mb-2">{order.scenarios.title}</h2>
-                    <p className="text-gray-600 mb-4 text-sm">{order.scenarios.description}</p>
-
-                    <div className="border-t border-gray-100 pt-4">
-                        <div
-                            className="bg-black rounded-2xl overflow-hidden max-h-[400px] mb-3 border border-gray-100 shadow-inner">
-                            {order.proof_type === 'video' ? (
-                                <video src={order.proof_url} controls className="w-full h-full object-contain"/>
-                            ) : (
-                                <img src={order.proof_url} className="w-full h-full object-contain"/>
-                            )}
-                        </div>
-                        <div className="bg-gray-50 p-4 rounded-2xl text-sm italic border border-gray-100">
-                            <span
-                                className="font-bold text-xs text-gray-400 uppercase block mb-1">Коментар виконавця</span>
-                            "{order.proof_description}"
-                        </div>
-                    </div>
-                </div>
-
-                {/* Voting Buttons */}
-                {!myVote && user?.id !== order.performer_id && user?.id !== order.customer_id ? (
-                    <div className="flex gap-4">
-                        <button
-                            onClick={() => handleVote('customer')}
-                            className="flex-1 py-4 bg-red-100 text-red-700 font-bold rounded-2xl hover:bg-red-200 transition shadow-sm"
-                        >
-                            👎 Не вірно<br/><span className="text-xs font-normal">Повернути гроші</span>
-                        </button>
-                        <button
-                            onClick={() => handleVote('performer')}
-                            className="flex-1 py-4 bg-green-100 text-green-700 font-bold rounded-2xl hover:bg-green-200 transition shadow-sm"
-                        >
-                            👍 Вірно<br/><span className="text-xs font-normal">Виплатити гроші</span>
-                        </button>
-                    </div>
+        <motion.section
+            initial={{opacity: 0, scale: 0.95}}
+            animate={{opacity: 1, scale: 1}}
+            transition={{duration: 0.5}}
+            className="h-[calc(100vh-70px)] w-full snap-start flex flex-col lg:flex-row bg-white"
+        >
+            {/* ВІДЕО ЗЛІВА */}
+            <div className="flex-[1.8] bg-black relative cursor-pointer" onClick={() => {
+                if (videoRef.current) {
+                    isPlaying ? videoRef.current.pause() : videoRef.current.play();
+                    setIsPlaying(!isPlaying);
+                }
+            }}>
+                {videoUrl ? (
+                    <video
+                        ref={videoRef}
+                        src={videoUrl}
+                        className="w-full h-full object-cover"
+                        autoPlay loop muted playsInline
+                    />
                 ) : (
-                    <div
-                        className="text-center bg-gray-100 p-4 rounded-2xl text-gray-500 font-bold border border-gray-200">
-                        {myVote ? "Дякуємо за ваш голос!" : "Учасники конфлікту не голосують."}
+                    <div className="h-full flex flex-col items-center justify-center text-gray-500 bg-gray-900">
+                        <span className="text-4xl mb-2">🚫</span>
+                        <p className="font-black text-[10px] uppercase">Відео не завантажено</p>
+                    </div>
+                )}
+                {!isPlaying && videoUrl && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/20">
+                        <span className="text-white text-5xl opacity-50">▶</span>
                     </div>
                 )}
             </div>
-        </div>
+
+            {/* ПАНЕЛЬ СПРАВА */}
+            <div
+                className="flex-1 flex flex-col p-8 lg:p-14 justify-center bg-white border-l border-gray-50 overflow-y-auto">
+
+                <div className="mb-8 p-5 bg-red-50 rounded-[35px] border border-red-100 text-center">
+                    <span className="text-[10px] font-black text-red-400 uppercase tracking-widest block mb-1">До авто-повернення:</span>
+                    <span className="text-2xl font-black text-red-600 tabular-nums">{timeLeft}</span>
+                </div>
+
+                <div className="mb-8">
+                    <span
+                        className="inline-block px-3 py-1 bg-gray-100 rounded-full text-[9px] font-black text-gray-400 uppercase mb-4">Суть конфлікту</span>
+                    <h2 className="text-3xl lg:text-5xl font-black text-gray-900 leading-[1.1] italic tracking-tighter">
+                        "{d.scenarios?.description || "Опис відсутній"}"
+                    </h2>
+                </div>
+
+                {/* Аватари */}
+                <div className="flex items-center gap-4 mb-10">
+                    <div onClick={() => navigate(`/MapPages?profile=${d.performer?.id}`)}
+                         className="flex-1 flex items-center gap-3 p-3 bg-gray-50 rounded-3xl border border-gray-100 cursor-pointer hover:bg-green-50 transition-all">
+                        <img src={d.performer?.avatar_url || "/default-avatar.png"}
+                             className="w-12 h-12 rounded-full object-cover border-2 border-white shadow-sm"/>
+                        <div className="overflow-hidden">
+                            <span className="block text-[8px] font-black uppercase text-gray-400">Виконавець</span>
+                            <span
+                                className="block font-black text-xs truncate">{d.performer?.display_name || "Анонім"}</span>
+                        </div>
+                    </div>
+                    <div className="font-black text-gray-200">VS</div>
+                    <div onClick={() => navigate(`/MapPages?profile=${d.customer?.id}`)}
+                         className="flex-1 flex items-center gap-3 p-3 bg-gray-50 rounded-3xl border border-gray-100 cursor-pointer hover:bg-red-50 transition-all">
+                        <img src={d.customer?.avatar_url || "/default-avatar.png"}
+                             className="w-12 h-12 rounded-full object-cover border-2 border-white shadow-sm"/>
+                        <div className="overflow-hidden">
+                            <span className="block text-[8px] font-black uppercase text-gray-400">Замовник</span>
+                            <span
+                                className="block font-black text-xs truncate">{d.customer?.display_name || "Анонім"}</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4 mb-10">
+                    <div className="p-6 bg-gray-50 rounded-[35px] border border-gray-100">
+                        <span className="text-[10px] font-black text-gray-300 uppercase block mb-1">Escrow</span>
+                        <span className="text-2xl font-black">{d.scenarios?.price || 0} USDT</span>
+                    </div>
+                    <button onClick={() => navigate(`/order-details/${d.id}`)}
+                            className="p-6 bg-gray-50 rounded-[35px] border border-gray-100 text-left hover:bg-gray-100 transition-all">
+                        <span className="text-[10px] font-black text-gray-300 uppercase block mb-1">Місце</span>
+                        <span className="font-black text-sm">КАРТА 📍</span>
+                    </button>
+                </div>
+
+                {/* Кнопки */}
+                <div className="flex flex-col gap-4">
+                    <button onClick={() => onVote(d.id, 'for')}
+                            className="w-full py-6 bg-[#22c55e] text-white rounded-full font-black text-xl shadow-xl active:scale-95 transition-all">👍
+                        ВИКОНАВЕЦЬ ПРАВИЙ
+                    </button>
+                    <button onClick={() => onVote(d.id, 'against')}
+                            className="w-full py-6 bg-white border-2 border-red-500 text-red-500 rounded-full font-black text-xl active:scale-95 transition-all">👎
+                        ЗАМОВНИК ПРАВИЙ
+                    </button>
+                </div>
+            </div>
+        </motion.section>
     );
 }

@@ -1,6 +1,6 @@
 import {StrictMode, useEffect} from "react";
 import {createRoot} from "react-dom/client";
-import {BrowserRouter, Routes, Route} from "react-router-dom";
+import {BrowserRouter, Routes, Route, Navigate} from "react-router-dom";
 import "./index.css";
 
 import RegisterPage from "./pages/Enteres_register/register/register";
@@ -23,6 +23,7 @@ import 'react-toastify/dist/ReactToastify.css';
 
 // @ts-ignore
 import {registerSW} from "virtual:pwa-register";
+import DisputeNotFound from "./pages/DisputeNotFound";
 
 
 registerSW({immediate: true});
@@ -98,6 +99,7 @@ createRoot(container).render(
                     <Nav_bar/>
                     <main>
                         <Routes>
+                            <Route path="/" element={<Navigate to="/MapPages" replace/>}/>
                             <Route path="/Register" element={<RegisterPage/>}/>
                             <Route path="/EnterPage" element={<EnterPage/>}/>
                             <Route path="/manifestPage" element={<ManifestPage/>}/>
@@ -113,6 +115,7 @@ createRoot(container).render(
                             <Route path="/order-details/:orderId" element={<OrderDetailsPage/>}/>
                             <Route path="/edit-order/:orderId" element={<EditOrderPage/>}/>
                             <Route path="/dispute/:orderId" element={<DisputePage/>}/>
+                            <Route path="/dispute/not-found" element={<DisputeNotFound/>}/>
                         </Routes>
                     </main>
                 </div>

@@ -1,58 +1,69 @@
 import React, {useState, useEffect, useCallback} from "react";
 import {supabase} from "../lib/supabaseClient";
 import {useAuth} from "../context/AuthProvider";
-import {Link, useNavigate} from "react-router-dom";
+import {useNavigate} from "react-router-dom";
+import {toast} from "react-toastify";
+import {motion, AnimatePresence} from "framer-motion";
+import {useEscrow} from "../hooks/useEscrow"; // Ваш кастомний хук
 
 interface OrderItem {
     order_id: number;
+    scenario_id: number;
     order_status: string;
     execution_time: string;
     title: string;
     description: string;
     price: number;
+    proof_description: string | null;
+    proof_url: string | null;
+    performer_id: string | null;
     counterparty_name: string | null;
     counterparty_avatar: string | null;
-    location_lat: number | null;
-    location_lng: number | null;
 }
+
+const statusLabels: Record<string, { label: string; color: string }> = {
+    pending: {label: "Очікує підтвердження", color: "bg-gray-100 text-gray-500"},
+    in_progress: {label: "У стадії виконання", color: "bg-blue-100 text-blue-600"},
+    completed_by_executor: {label: "Очікує вашої перевірки", color: "bg-pink-100 text-pink-600"},
+    disputed: {label: "Оскаржується", color: "bg-red-100 text-red-600"},
+    resolved: {label: "Виконано", color: "bg-green-100 text-green-600"},
+    cancelled: {label: "Скасовано", color: "bg-gray-200 text-gray-400"}
+};
 
 export default function MyOrdersPage() {
     const {user} = useAuth();
     const navigate = useNavigate();
 
-    const [performerOrders, setPerformerOrders] = useState<OrderItem[]>([]);
-    const [customerOrders, setCustomerOrders] = useState<OrderItem[]>([]);
+    // Підключаємо логіку Escrow виплати
+    const {confirmAndRelease, escrowLoading} = useEscrow();
+
+    const [orders, setOrders] = useState<OrderItem[]>([]);
     const [loading, setLoading] = useState(true);
-    const [activeTab, setActiveTab] = useState<'in_progress' | 'completed' | 'my_requests'>('in_progress');
+
+    const [viewingProof, setViewingProof] = useState<OrderItem | null>(null);
+    const [isRatingStep, setIsRatingStep] = useState(false);
+    const [rating, setRating] = useState(10);
+    const [reviewComment, setReviewComment] = useState("");
 
     const fetchData = useCallback(async () => {
         if (!user) return;
         setLoading(true);
         try {
-            // 1. Performer orders
-            const {data: perfData} = await supabase.rpc('get_my_accepted_orders');
-            if (perfData) {
-                const mappedPerf = perfData.map((o: any) => ({
-                    ...o,
-                    counterparty_name: o.requester_name,
-                    counterparty_avatar: o.requester_avatar
-                }));
-                setPerformerOrders(mappedPerf);
+            const {data, error} = await supabase.rpc('get_my_created_orders');
+            if (error) throw error;
+            if (data) {
+                const mapped = data
+                    .map((o: any) => ({
+                        ...o,
+                        order_status: o.status,
+                        counterparty_name: o.performer_name || "Очікує виконання",
+                        counterparty_avatar: o.performer_avatar
+                    }))
+                    .filter((o: OrderItem) => o.order_status !== 'resolved' && o.order_status !== 'cancelled');
+                setOrders(mapped);
             }
-
-            // 2. Customer orders
-            const {data: custData} = await supabase.rpc('get_my_created_orders');
-            if (custData) {
-                const mappedCust = custData.map((o: any) => ({
-                    ...o,
-                    counterparty_name: o.performer_name || "Ще не призначено",
-                    counterparty_avatar: o.performer_avatar
-                }));
-                setCustomerOrders(mappedCust);
-            }
-
         } catch (err: any) {
-            console.error(err);
+            console.error("Помилка завантаження:", err);
         } finally {
             setLoading(false);
         }
@@ -60,171 +71,246 @@ export default function MyOrdersPage() {
 
     useEffect(() => {
         fetchData();
-        const channel = supabase
-            .channel('my-orders-update')
-            .on('postgres_changes', {event: '*', schema: 'public', table: 'orders'}, () => fetchData())
-            .subscribe();
-        return () => {
-            supabase.removeChannel(channel);
-        };
     }, [fetchData]);
 
-    const getDisplayedOrders = () => {
-        if (activeTab === 'in_progress') {
-            return performerOrders.filter(o => o.order_status === 'in_progress');
+    // --- ФІНАЛЬНЕ ПІДТВЕРДЖЕННЯ ТА ВИПЛАТА 90/5/5 ---
+    const handleFinalApprove = async () => {
+        if (!viewingProof || !user) return;
+
+        try {
+            // КРОК 1: Блокчейн (Виплата через MetaMask)
+            // Контракт сам розподіляє кошти на гаманці Виконавця, Адміна та Реферала
+            const txSuccess = await confirmAndRelease(viewingProof.order_id);
+
+            if (!txSuccess) {
+                // Якщо транзакція відхилена клієнтом або сталась помилка - припиняємо
+                return;
+            }
+
+            // КРОК 2: Supabase (Оновлення статусу замовлення)
+            const {error: orderError} = await supabase
+                .from('orders')
+                .update({status: 'resolved'})
+                .eq('id', viewingProof.order_id);
+
+            if (orderError) throw orderError;
+
+            // КРОК 3: Відгук (Зберігаємо оцінку виконавця)
+            const {error: reviewError} = await supabase
+                .from('reviews')
+                .insert({
+                    reviewer_id: user.id,
+                    reviewee_id: viewingProof.performer_id,
+                    order_id: viewingProof.order_id,
+                    rating: rating,
+                    comment: reviewComment
+                });
+
+            if (reviewError) throw reviewError;
+
+            toast.success("Кошти розподілені (90/5/5)! Угоду завершено. 💸✨");
+
+            // Скидання станів та оновлення списку
+            setViewingProof(null);
+            setIsRatingStep(false);
+            setReviewComment("");
+            fetchData();
+        } catch (e: any) {
+            toast.error("Помилка синхронізації після оплати: " + e.message);
         }
-        if (activeTab === 'completed') {
-            return performerOrders.filter(o => ['completed', 'expired'].includes(o.order_status));
-        }
-        if (activeTab === 'my_requests') {
-            return customerOrders;
-        }
-        return [];
     };
 
-    const displayedOrders = getDisplayedOrders();
+    const handleDisputeClick = async (order: OrderItem) => {
+        if (order.order_status === 'disputed') {
+            navigate(`/dispute/${order.order_id}`);
+        } else {
+            const {error} = await supabase
+                .from('orders')
+                .update({status: 'disputed', disputed_at: new Date().toISOString()})
+                .eq('id', order.order_id);
 
-    if (loading) return <div className="p-10 text-center animate-pulse">Завантаження...</div>;
+            if (!error) {
+                toast.warn("Диспут розпочато! Кошти заблоковані до рішення арбітра.");
+                navigate(`/dispute/${order.order_id}`);
+            }
+        }
+    };
+
+    if (loading) return <div
+        className="p-10 text-center font-black animate-pulse text-gray-300 uppercase italic">Синхронізація
+        блокчейну...</div>;
 
     return (
-        <div className="min-h-screen bg-gray-50 pb-24">
-            <div className="max-w-3xl mx-auto p-6 space-y-6">
+        <div className="min-h-screen bg-[#fcfcfc] p-6 font-sans">
+            <main className="max-w-5xl mx-auto space-y-8">
+                <h2 className="text-4xl font-black mb-8 text-gray-900 tracking-tighter italic">Мої замовлення</h2>
 
-                <h1 className="text-3xl font-bold text-center text-gray-900 mt-4">Мої Завдання</h1>
-
-                <div className="flex bg-white p-1 rounded-2xl shadow-sm border border-gray-100 overflow-x-auto">
-                    <button
-                        onClick={() => setActiveTab('in_progress')}
-                        className={`flex-1 py-3 px-2 rounded-xl text-xs sm:text-sm font-bold transition-all whitespace-nowrap ${
-                            activeTab === 'in_progress' ? 'bg-[#ffcdd6] text-white shadow-md' : 'text-gray-500 hover:bg-gray-50'
-                        }`}
-                    >
-                        В роботі ⚡️
-                    </button>
-                    <button
-                        onClick={() => setActiveTab('completed')}
-                        className={`flex-1 py-3 px-2 rounded-xl text-xs sm:text-sm font-bold transition-all whitespace-nowrap ${
-                            activeTab === 'completed' ? 'bg-green-500 text-white shadow-md' : 'text-gray-500 hover:bg-gray-50'
-                        }`}
-                    >
-                        Виконані ✅
-                    </button>
-                </div>
-
-                {displayedOrders.length === 0 ? (
-                    <div className="text-center py-16 text-gray-400">
-                        Список порожній.
+                {orders.length === 0 ? (
+                    <div
+                        className="text-center py-20 bg-white rounded-[45px] border border-gray-100 text-gray-400 font-bold uppercase tracking-widest">
+                        Активних замовлень немає
                     </div>
                 ) : (
-                    <div className="grid grid-cols-1 gap-5">
-                        {displayedOrders.map((order) => (
-                            <OrderCard
-                                key={order.order_id}
-                                order={order}
-                                navigate={navigate}
-                                isCustomerTab={activeTab === 'my_requests'}
-                            />
-                        ))}
-                    </div>
+                    orders.map((order) => {
+                        const statusInfo = statusLabels[order.order_status] || {
+                            label: order.order_status,
+                            color: "bg-gray-100"
+                        };
+                        return (
+                            <div key={order.order_id}
+                                 className="bg-white border border-black/[0.04] rounded-[45px] p-8 shadow-sm relative overflow-hidden transition-all hover:shadow-md">
+                                <div className="flex flex-col lg:flex-row justify-between gap-10">
+                                    <div className="flex-1">
+                                        <div className="mb-4 flex items-center gap-3">
+                                            <span
+                                                className="bg-gray-100 text-gray-400 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-tighter">ID: {order.order_id}</span>
+                                            <span
+                                                className={`text-[10px] font-black uppercase px-4 py-1.5 rounded-full ${statusInfo.color} shadow-sm border border-black/5`}>
+                                                {statusInfo.label}
+                                            </span>
+                                        </div>
+                                        <h3 className="text-2xl font-black mb-4">{order.title}</h3>
+                                        <div
+                                            className="p-6 bg-gray-50/50 rounded-3xl border border-gray-100/50 mb-6 italic font-medium text-gray-600 leading-relaxed">
+                                            "{order.description}"
+                                        </div>
+                                    </div>
+                                    <div
+                                        className="lg:w-48 text-center bg-white rounded-[40px] p-8 flex flex-col justify-center border border-gray-100 shadow-sm">
+                                        <span
+                                            className="text-[10px] font-black text-gray-300 uppercase mb-1 tracking-widest">Депозит</span>
+                                        <div className="text-4xl font-black text-gray-900">{order.price}</div>
+                                        <div
+                                            className="text-[10px] font-black text-pink-400 tracking-widest mt-1">USDT
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="mt-8 flex flex-col gap-3">
+                                    {order.order_status === 'completed_by_executor' ? (
+                                        <button onClick={() => {
+                                            setViewingProof(order);
+                                            setIsRatingStep(false);
+                                        }}
+                                                className="w-full py-6 bg-black text-white rounded-full font-black text-xl shadow-xl active:scale-95 transition-all uppercase tracking-tight">
+                                            👀 ПЕРЕВІРИТИ ТА ВИПЛАТИТИ
+                                        </button>
+                                    ) : (
+                                        <button onClick={() => navigate(`/edit-order/${order.order_id}`)}
+                                                className="w-full py-5 bg-[#ffcbd5] hover:bg-[#ffb6c5] rounded-full font-black text-lg text-gray-800 transition-all shadow-sm active:scale-95">
+                                            🤝 Редагувати умови
+                                        </button>
+                                    )}
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <button onClick={() => handleDisputeClick(order)}
+                                                className="py-5 bg-gray-50 hover:bg-red-50 hover:text-red-500 rounded-full font-bold text-gray-400 transition-all uppercase text-xs tracking-widest">
+                                            ⚖️ Оскаржити
+                                        </button>
+                                        <button onClick={() => navigate(`/order-details/${order.order_id}`)}
+                                                className="py-5 bg-gray-50 hover:bg-gray-100 rounded-full font-bold text-gray-400 transition-all uppercase text-xs tracking-widest">
+                                            🗺️ Локація
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })
                 )}
-            </div>
+            </main>
+
+            {/* --- МОДАЛЬНЕ ВІКНО ПЕРЕВІРКИ ТА ВИПЛАТИ --- */}
+            <AnimatePresence>
+                {viewingProof && (
+                    <motion.div initial={{opacity: 0}} animate={{opacity: 1}} exit={{opacity: 0}}
+                                className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-md flex items-center justify-center p-4">
+                        <motion.div initial={{scale: 0.9, y: 20}} animate={{scale: 1, y: 0}} exit={{scale: 0.9, y: 20}}
+                                    className="bg-white w-full max-w-2xl rounded-[50px] overflow-hidden shadow-2xl flex flex-col max-h-[90vh]">
+                            <div className="p-10 overflow-y-auto no-scrollbar">
+                                {!isRatingStep ? (
+                                    /* КРОК 1: ПЕРЕВІРКА ВІДЕО-ДОКАЗУ */
+                                    <div className="animate-in fade-in duration-300">
+                                        <h3 className="text-3xl font-black mb-6 tracking-tight italic">Звіт
+                                            виконавця</h3>
+                                        <div
+                                            className="rounded-[35px] overflow-hidden bg-black aspect-video mb-8 border-4 border-gray-50 shadow-inner">
+                                            {viewingProof.proof_url ? (
+                                                <video
+                                                    src={supabase.storage.from('order-proofs').getPublicUrl(viewingProof.proof_url).data.publicUrl}
+                                                    controls autoPlay className="w-full h-full object-cover"/>
+                                            ) : (
+                                                <div
+                                                    className="h-full flex items-center justify-center text-gray-500 font-bold uppercase text-xs tracking-widest">Завантаження
+                                                    доказів...</div>
+                                            )}
+                                        </div>
+                                        <div className="mb-10">
+                                            <label
+                                                className="text-[10px] font-black uppercase text-gray-400 tracking-widest mb-2 block ml-2">Коментар
+                                                до звіту</label>
+                                            <p className="text-lg font-bold text-gray-800 leading-relaxed italic p-6 bg-gray-50 rounded-3xl border border-gray-100">
+                                                "{viewingProof.proof_description || "Коментар відсутній"}"
+                                            </p>
+                                        </div>
+                                        <div className="flex flex-col gap-4">
+                                            <button onClick={() => setIsRatingStep(true)}
+                                                    className="w-full py-6 bg-green-500 text-white rounded-full font-black text-xl shadow-lg hover:bg-green-600 transition-all active:scale-95 uppercase tracking-tighter">
+                                                👍 ПРИЙНЯТИ (ДО ОЦІНКИ)
+                                            </button>
+                                            <button onClick={() => handleDisputeClick(viewingProof)}
+                                                    className="w-full py-5 bg-red-50 text-red-500 rounded-full font-black text-lg hover:bg-red-100 transition-all uppercase tracking-tighter">
+                                                👎 ВІДХИЛИТИ (ДИСПУТ)
+                                            </button>
+                                            <button onClick={() => setViewingProof(null)}
+                                                    className="w-full py-4 text-gray-300 font-bold uppercase text-[10px] tracking-widest">Закрити
+                                            </button>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    /* КРОК 2: ОЦІНКА ТА РОЗПОДІЛ КОШТІВ (MetaMask) */
+                                    <div
+                                        className="animate-in slide-in-from-bottom-4 duration-500 flex flex-col items-center">
+                                        <h3 className="text-3xl font-black mb-2 italic tracking-tight uppercase">Оцінка
+                                            роботи</h3>
+                                        <p className="text-gray-400 text-[10px] font-black mb-10 uppercase tracking-[0.3em]">Підпишіть
+                                            виплату в MetaMask</p>
+
+                                        <div className="flex flex-wrap justify-center gap-2 mb-10">
+                                            {[...Array(10)].map((_, i) => (
+                                                <button key={i} onClick={() => setRating(i + 1)}
+                                                        className={`w-11 h-11 rounded-full font-black transition-all ${rating === i + 1 ? 'bg-pink-400 text-white scale-110 shadow-lg' : 'bg-gray-100 text-gray-400 hover:bg-gray-200'}`}>
+                                                    {i + 1}
+                                                </button>
+                                            ))}
+                                        </div>
+
+                                        <div className="w-full mb-10">
+                                            <label
+                                                className="text-[10px] font-black uppercase text-gray-400 tracking-widest mb-2 block ml-4">Твій
+                                                відгук</label>
+                                            <textarea value={reviewComment}
+                                                      onChange={(e) => setReviewComment(e.target.value)}
+                                                      placeholder="Як все пройшло?"
+                                                      className="w-full p-8 bg-gray-50 rounded-[40px] border border-gray-100 outline-none h-32 italic font-medium focus:border-pink-200 transition-all"/>
+                                        </div>
+
+                                        <div className="flex flex-col gap-4 w-full">
+                                            <button
+                                                onClick={handleFinalApprove}
+                                                disabled={escrowLoading}
+                                                className="w-full py-6 bg-black text-white rounded-full font-black text-xl shadow-xl active:scale-95 transition-all uppercase tracking-widest disabled:bg-gray-400"
+                                            >
+                                                {escrowLoading ? "ВЗАЄМОДІЯ З METAMASK..." : "✅ ПІДТВЕРДИТИ ТА ОПЛАТИТИ"}
+                                            </button>
+                                            <button onClick={() => setIsRatingStep(false)}
+                                                    className="w-full py-4 text-gray-400 font-bold uppercase text-[10px] tracking-widest">Назад
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
         </div>
     );
 }
-
-const OrderCard: React.FC<{ order: OrderItem, navigate: any, isCustomerTab: boolean }> = ({
-                                                                                              order,
-                                                                                              navigate,
-                                                                                              isCustomerTab
-                                                                                          }) => {
-
-    const handleClick = () => {
-        if (isCustomerTab) return;
-
-        const requestFormat = {
-            order_id: order.order_id,
-            status: order.order_status,
-            execution_time: order.execution_time,
-            title: order.title,
-            description: order.description,
-            price: order.price,
-            other_name: order.counterparty_name,
-            other_avatar: order.counterparty_avatar,
-            location_lat: order.location_lat,
-            location_lng: order.location_lng
-        };
-        navigate(`/order-details/${order.order_id}`, {state: {request: requestFormat}});
-    };
-
-    const handleEdit = (e: React.MouseEvent) => {
-        e.stopPropagation();
-        navigate(`/edit-order/${order.order_id}`);
-    };
-
-    let statusBadge = "bg-gray-100 text-gray-600";
-    let statusText = order.order_status;
-
-    if (order.order_status === 'in_progress') {
-        statusBadge = "bg-blue-100 text-blue-700";
-        statusText = "В роботі";
-    } else if (order.order_status === 'completed') {
-        statusBadge = "bg-green-100 text-green-700";
-        statusText = "Завершено";
-    } else if (order.order_status === 'completed_pending_approval') {
-        statusBadge = "bg-orange-100 text-orange-700 animate-pulse";
-        statusText = "Очікує підтвердження";
-    } else if (order.order_status === 'paid_pending_execution') {
-        statusBadge = "bg-purple-100 text-purple-700";
-        statusText = "Оплачено, очікує";
-    } else if (order.order_status === 'pending_execution') {
-        statusBadge = "bg-yellow-100 text-yellow-700";
-        statusText = "Очікує";
-    }
-
-    return (
-        <div
-            onClick={handleClick}
-            className={`group bg-white p-5 rounded-3xl border border-white shadow-[0_5px_20px_-5px_#ffcdd6] relative transition-transform ${
-                !isCustomerTab ? 'cursor-pointer hover:scale-[1.02]' : ''
-            }`}
-        >
-            {isCustomerTab && order.order_status !== 'completed' && order.order_status !== 'expired' && (
-                <button
-                    onClick={handleEdit}
-                    className="absolute top-4 right-4 z-10 p-2 bg-white border border-gray-100 text-gray-400 hover:text-blue-600 hover:border-blue-200 rounded-xl shadow-sm transition-all cursor-pointer"
-                    title="Редагувати"
-                >
-                    ✏️
-                </button>
-            )}
-
-            <div className="flex justify-between items-start mb-3 pr-10">
-                <span className={`px-3 py-1 rounded-lg text-xs font-bold ${statusBadge}`}>
-                    {statusText}
-                </span>
-                {!isCustomerTab && (
-                    <span className={`font-bold text-sm ${order.price > 0 ? 'text-green-600' : 'text-pink-500'}`}>
-                        {order.price > 0 ? `${order.price} USDT` : "Free"}
-                    </span>
-                )}
-            </div>
-
-            <h3 className="font-bold text-lg text-gray-900 mb-1 leading-tight">{order.title}</h3>
-            <p className="text-gray-500 text-sm line-clamp-1">{order.description}</p>
-
-            <div className="mt-4 flex items-center gap-3 pt-3 border-t border-gray-50">
-                <div className="w-8 h-8 rounded-full border border-gray-200 overflow-hidden shadow-sm">
-                    <img src={order.counterparty_avatar || '/logo_for_reg.jpg'} className="w-full h-full object-cover"/>
-                </div>
-                <div>
-                    <span className="text-[10px] text-gray-400 block uppercase font-bold">
-                        {isCustomerTab ? "Виконавець" : "Замовник"}
-                    </span>
-                    <span className="text-sm font-bold text-gray-700">
-                        {order.counterparty_name}
-                    </span>
-                </div>
-            </div>
-        </div>
-    );
-};
