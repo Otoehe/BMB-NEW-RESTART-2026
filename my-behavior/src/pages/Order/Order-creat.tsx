@@ -1,288 +1,172 @@
-import React, {useState, useEffect} from "react";
-import {useLocation, useNavigate} from "react-router-dom";
-import {supabase} from "../../lib/supabaseClient";
-import {useAuth} from "../../context/AuthProvider";
-import Map, {Marker, NavigationControl} from "react-map-gl/mapbox";
-import "mapbox-gl/dist/mapbox-gl.css";
-import {toast} from "react-toastify";
-import {motion, AnimatePresence} from "framer-motion";
-import {useEscrow} from "../../hooks/useEscrow"; // 1. Імпортуємо ваш хук
+import React, { useMemo, useState } from "react";
+import { toast } from "react-toastify";
+import { useEscrow } from "../../hooks/useEscrow";
 
-const MAPBOX_TOKEN = "pk.eyJ1IjoiYnV5bXliaWhhdmlvciIsImEiOiJjbWM4MzU3cDQxZGJ0MnFzM3NnOHhnaWM4In0.wShhGG9EvmIVxcHjBHImXw";
+// ВАЖЛИВО:
+// "Погодити угоду" = approve USDT + createOrder (депозит)
+// "Підтвердити виконання" = confirmCompletionByCustomer(orderId, executorSignature)
+// executorSignature — це підпис ВИКОНАВЦЯ (performer) з його гаманця (off-chain), який ти вставляєш сюди.
 
-export default function CreateOrderPage() {
-    const {user} = useAuth();
-    const navigate = useNavigate();
-    const locationHook = useLocation();
-    const {depositFunds, escrowLoading} = useEscrow(); // 2. Підключаємо Escrow
+const inputBase =
+  "w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-white placeholder-white/40 outline-none focus:border-white/30";
 
-    const performerId = locationHook.state?.performerId;
+const btnPrimary =
+  "w-full rounded-xl bg-emerald-500 px-4 py-3 font-semibold text-black hover:bg-emerald-400 active:scale-[0.99] transition";
 
-    // Додано поле wallet для виконавця
-    const [performer, setPerformer] = useState({name: "Користувач", avatar: null, wallet: ""});
-    const [loading, setLoading] = useState(false);
+const btnSecondary =
+  "w-full rounded-xl bg-white/10 px-4 py-3 font-semibold text-white hover:bg-white/15 active:scale-[0.99] transition border border-white/10";
 
-    const [title, setTitle] = useState("");
-    const [description, setDescription] = useState("");
-    const [price, setPrice] = useState<number | "">("");
-    const [date, setDate] = useState("");
-    const [time, setTime] = useState("");
+export default function OrderCreatePage() {
+  const { approveUSDT, createOrder, confirmCompletionByCustomer } = useEscrow();
 
-    const [selectedCoords, setSelectedCoords] = useState<{ lat: number, lng: number } | null>(null);
-    const [isMapOpen, setIsMapOpen] = useState(false);
+  // 1) CREATE + DEPOSIT
+  const [orderId, setOrderId] = useState<string>("");
+  const [amountUSDT, setAmountUSDT] = useState<string>(""); // наприклад "10"
+  const [performer, setPerformer] = useState<string>("");
+  const [referrer, setReferrer] = useState<string>(""); // може бути пусто
 
-    const today = new Date().toISOString().split("T")[0];
+  // 2) CONFIRM COMPLETION
+  const [confirmOrderId, setConfirmOrderId] = useState<string>("");
+  const [executorSignature, setExecutorSignature] = useState<string>(""); // 0x...
 
-    // Завантаження профілю виконавця (тепер беремо і гаманець)
-    useEffect(() => {
-        if (performerId) {
-            supabase
-                .from("profiles")
-                .select("display_name, avatar_url, wallet")
-                .eq("id", performerId)
-                .single()
-                .then(({data}) => {
-                    if (data) {
-                        setPerformer({
-                            name: data.display_name || "Користувач",
-                            avatar: data.avatar_url,
-                            wallet: data.wallet || "" // Гаманець виконавця
-                        });
-                    }
-                });
-        }
-    }, [performerId]);
+  const referrerOrZero = useMemo(() => {
+    const v = (referrer || "").trim();
+    return v.length ? v : "0x0000000000000000000000000000000000000000";
+  }, [referrer]);
 
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
-        if (!user || !performerId) return;
-        if (!selectedCoords) return toast.error("Оберіть місце на карті!");
-        if (!date || !time) return toast.error("Вкажіть дату та час!");
-        if (!performer.wallet) return toast.error("У виконавця не підключений гаманець!");
+  const onApproveAndCreate = async () => {
+    try {
+      const oid = Number(orderId);
+      if (!Number.isFinite(oid) || oid <= 0) {
+        toast.error("Вкажи orderId (число > 0)");
+        return;
+      }
+      if (!amountUSDT || Number(amountUSDT) <= 0) {
+        toast.error("Вкажи суму USDT (наприклад 10)");
+        return;
+      }
+      if (!performer || !performer.startsWith("0x") || performer.length < 42) {
+        toast.error("Вкажи адресу виконавця (0x...)");
+        return;
+      }
+      if (!referrerOrZero.startsWith("0x") || referrerOrZero.length < 42) {
+        toast.error("Referrer має бути 0x... або лиши поле пустим");
+        return;
+      }
 
-        setLoading(true);
+      // 1) approve USDT
+      const okApprove = await approveUSDT(amountUSDT);
+      if (!okApprove) return;
 
-        try {
-            const numericPrice = price === "" ? 0 : Number(price);
-            const executionDateTime = new Date(`${date}T${time}`).toISOString();
+      // 2) createOrder -> transferFrom клієнта в escrow
+      const okCreate = await createOrder(oid, performer, referrerOrZero, amountUSDT);
+      if (!okCreate) return;
 
-            // Генеруємо унікальний числовий ID для смарт-контракту
-            const blockchainOrderId = Date.now();
+      toast.success("Угоду погоджено: депозит USDT внесено ✅");
+    } catch (e: any) {
+      toast.error(e?.message || "Помилка створення угоди");
+    }
+  };
 
-            // КРОК 1: Створення сценарію в Supabase
-            const {data: scenarioData, error: scenarioError} = await supabase
-                .from("scenarios")
-                .insert({
-                    creator_id: user.id,
-                    title: title.trim(),
-                    description: description.trim(),
-                    price: numericPrice,
-                })
-                .select()
-                .single();
+  const onConfirmCompletion = async () => {
+    try {
+      const oid = Number(confirmOrderId);
+      if (!Number.isFinite(oid) || oid <= 0) {
+        toast.error("Вкажи orderId (число > 0)");
+        return;
+      }
+      const sig = (executorSignature || "").trim();
+      if (!sig.startsWith("0x") || sig.length < 132) {
+        toast.error("Встав executorSignature (0x... 65 bytes)");
+        return;
+      }
 
-            if (scenarioError) throw scenarioError;
+      const ok = await confirmCompletionByCustomer(oid, sig);
+      if (!ok) return;
 
-            // КРОК 2: Оплата через MetaMask (Escrow 90/5/5)
-            // Тут ми блокуємо кошти в контракті
-            toast.info("Підтвердіть оплату в MetaMask...");
-            const txSuccess = await depositFunds(
-                blockchainOrderId,
-                numericPrice.toString(),
-                performer.wallet
-                // Тут можна додати адресу реферала, якщо вона є в cookies/localStorage
-            );
+      toast.success("Виконання підтверджено — кошти розподілено ✅");
+    } catch (e: any) {
+      toast.error(e?.message || "Помилка підтвердження виконання");
+    }
+  };
 
-            if (!txSuccess) {
-                // Якщо оплата не пройшла, видаляємо створений сценарій (опціонально)
-                await supabase.from("scenarios").delete().eq("id", scenarioData.id);
-                setLoading(false);
-                return;
-            }
+  return (
+    <div className="mx-auto max-w-2xl p-4 text-white">
+      <h1 className="text-2xl font-bold mb-4">Escrow — Угода</h1>
 
-            // КРОК 3: Створення замовлення з міткою оплати
-            const {error: orderError} = await supabase
-                .from("orders")
-                .insert({
-                    id: blockchainOrderId, // Використовуємо той самий ID, що і в блокчейні
-                    scenario_id: scenarioData.id,
-                    customer_id: user.id,
-                    performer_id: performerId,
-                    status: 'in_progress', // Змінюємо статус на "в роботі", бо вже оплачено
-                    execution_time: executionDateTime,
-                    location_lat: selectedCoords.lat,
-                    location_lng: selectedCoords.lng,
-                    location_coords: `POINT(${selectedCoords.lng} ${selectedCoords.lat})`,
-                });
+      {/* BLOCK 1 */}
+      <div className="rounded-2xl border border-white/10 bg-white/5 p-4 mb-5">
+        <h2 className="text-lg font-semibold mb-3">1) Погодити угоду (Approve + Депозит)</h2>
 
-            if (orderError) throw orderError;
+        <div className="space-y-3">
+          <input
+            className={inputBase}
+            value={orderId}
+            onChange={(e) => setOrderId(e.target.value)}
+            placeholder="orderId (число) напр. 101"
+          />
 
-            toast.success("✅ Оплачено та відправлено в роботу!");
-            navigate("/MapPages");
+          <input
+            className={inputBase}
+            value={amountUSDT}
+            onChange={(e) => setAmountUSDT(e.target.value)}
+            placeholder="Сума USDT напр. 10"
+          />
 
-        } catch (error: any) {
-            toast.error("Помилка: " + error.message);
-        } finally {
-            setLoading(false);
-        }
-    };
+          <input
+            className={inputBase}
+            value={performer}
+            onChange={(e) => setPerformer(e.target.value)}
+            placeholder="Адреса виконавця (performer) 0x..."
+          />
 
-    return (
-        <div className="min-h-screen bg-[#fcfcfc] p-6 md:p-10 font-sans text-gray-900">
-            <main className="max-w-3xl mx-auto">
-                <div className="flex items-center justify-between mb-10">
-                    <button onClick={() => navigate(-1)}
-                            className="text-gray-400 font-bold hover:text-black transition-colors">
-                        ← Назад
-                    </button>
-                    <h2 className="text-2xl font-black tracking-tight uppercase">Створити угоду</h2>
-                    <div className="w-10"></div>
-                </div>
+          <input
+            className={inputBase}
+            value={referrer}
+            onChange={(e) => setReferrer(e.target.value)}
+            placeholder="Referrer (опційно) 0x... або залиш пусто"
+          />
 
-                {/* Блок виконавця з перевіркою гаманця */}
-                <div
-                    className="bg-white border border-black/[0.03] rounded-[35px] p-6 mb-8 flex items-center justify-between shadow-sm">
-                    <div className="flex items-center gap-5">
-                        <img
-                            src={performer.avatar || "/logo_for_reg.jpg"}
-                            className="w-16 h-16 rounded-full border-4 border-white shadow-sm object-cover"
-                            alt="avatar"
-                        />
-                        <div>
-                            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Виконавець</p>
-                            <h4 className="text-xl font-black">{performer.name}</h4>
-                        </div>
-                    </div>
-                    {performer.wallet ? (
-                        <div
-                            className="text-[10px] bg-green-50 text-green-600 px-3 py-1 rounded-full font-black border border-green-100 uppercase">
-                            Гаманець підключено ✅
-                        </div>
-                    ) : (
-                        <div
-                            className="text-[10px] bg-red-50 text-red-500 px-3 py-1 rounded-full font-black border border-red-100 uppercase">
-                            Гаманець відсутній ❌
-                        </div>
-                    )}
-                </div>
+          <button className={btnPrimary} onClick={onApproveAndCreate}>
+            Погодити угоду (USDT approve + deposit)
+          </button>
 
-                <form onSubmit={handleSubmit} className="space-y-6">
-                    {/* Назва */}
-                    <div className="bg-white border border-black/[0.03] rounded-[30px] p-6">
-                        <label className="block font-black text-xs uppercase tracking-widest mb-3 ml-2 text-gray-400">Назва
-                            завдання</label>
-                        <input
-                            type="text" required placeholder="Наприклад: Пранк в кафе"
-                            value={title} onChange={(e) => setTitle(e.target.value)}
-                            className="w-full p-4 bg-gray-50 border-none rounded-2xl focus:ring-2 focus:ring-pink-100 transition-all font-bold"
-                        />
-                    </div>
-
-                    {/* Опис */}
-                    <div className="bg-white border border-black/[0.03] rounded-[40px] p-8">
-                        <label className="block font-black text-xs uppercase tracking-widest mb-4 text-gray-400">Детальний
-                            опис</label>
-                        <textarea
-                            required rows={4} value={description} onChange={(e) => setDescription(e.target.value)}
-                            className="w-full p-5 bg-gray-50 border-none rounded-3xl focus:ring-2 focus:ring-pink-100 transition-all resize-none text-lg font-medium italic"
-                        />
-                    </div>
-
-                    {/* Сума */}
-                    <div className="text-center py-6">
-                        <label className="block font-black text-xs uppercase tracking-widest mb-4 text-gray-400">Винагорода
-                            (Escrow)</label>
-                        <div
-                            className="inline-flex items-center bg-white border border-gray-100 rounded-[28px] px-10 py-5 shadow-sm">
-                            <input
-                                type="number" required placeholder="0"
-                                value={price}
-                                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
-                                className="text-4xl font-black w-28 text-center focus:outline-none"
-                            />
-                            <span className="text-xl font-black text-gray-300 ml-2">USDT</span>
-                        </div>
-                        <p className="text-[10px] text-gray-400 font-bold uppercase mt-4 tracking-tighter">
-                            * Кошти будуть заблоковані смарт-контрактом
-                        </p>
-                    </div>
-
-                    {/* Дата/Час */}
-                    <div className="grid grid-cols-2 gap-4">
-                        <div className="bg-white border border-black/[0.03] rounded-[25px] p-5">
-                            <label className="block text-[9px] font-black text-gray-400 uppercase mb-2">Дата</label>
-                            <input type="date" required min={today} value={date}
-                                   onChange={(e) => setDate(e.target.value)}
-                                   className="w-full font-black text-gray-800 focus:outline-none"/>
-                        </div>
-                        <div className="bg-white border border-black/[0.03] rounded-[25px] p-5">
-                            <label className="block text-[9px] font-black text-gray-400 uppercase mb-2">Час</label>
-                            <input type="time" required value={time} onChange={(e) => setTime(e.target.value)}
-                                   className="w-full font-black text-gray-800 focus:outline-none"/>
-                        </div>
-                    </div>
-
-                    {/* Локація */}
-                    <button
-                        type="button" onClick={() => setIsMapOpen(true)}
-                        className={`w-full py-5 rounded-[30px] border-2 border-dashed font-black transition-all
-                            ${selectedCoords ? 'border-green-400 bg-green-50 text-green-700' : 'border-gray-200 text-gray-400'}
-                        `}
-                    >
-                        {selectedCoords ? "📍 Локація зафіксована" : "🗺️ Обрати місце зустрічі"}
-                    </button>
-
-                    <div className="pt-8">
-                        <button
-                            type="submit"
-                            disabled={loading || escrowLoading}
-                            className="w-full py-6 bg-black text-white rounded-full font-black text-xl shadow-xl active:scale-95 disabled:bg-gray-200"
-                        >
-                            {loading || escrowLoading ? "ТРАНЗАКЦІЯ В ПРОЦЕСІ..." : "🚀 ОПЛАТИТИ ТА ВІДПРАВИТИ"}
-                        </button>
-                    </div>
-                </form>
-            </main>
-
-            {/* Модалка карти */}
-            <AnimatePresence>
-                {isMapOpen && (
-                    <div
-                        className="fixed inset-0 z-50 bg-black/60 backdrop-blur-md flex items-center justify-center p-4">
-                        <div
-                            className="bg-white w-full max-w-4xl h-[85vh] rounded-[50px] overflow-hidden flex flex-col shadow-2xl">
-                            <div className="p-8 border-b border-gray-100 flex justify-between items-center">
-                                <h3 className="font-black text-2xl italic">Точка виконання</h3>
-                                <button onClick={() => setIsMapOpen(false)}
-                                        className="w-12 h-12 bg-gray-100 rounded-full font-black">✕
-                                </button>
-                            </div>
-                            <div className="flex-1 relative">
-                                <Map
-                                    mapboxAccessToken={MAPBOX_TOKEN}
-                                    initialViewState={{latitude: 50.45, longitude: 30.52, zoom: 11}}
-                                    mapStyle="mapbox://styles/mapbox/light-v11"
-                                    onClick={(e) => setSelectedCoords({lat: e.lngLat.lat, lng: e.lngLat.lng})}
-                                >
-                                    <NavigationControl position="bottom-right"/>
-                                    {selectedCoords &&
-                                        <Marker longitude={selectedCoords.lng} latitude={selectedCoords.lat}
-                                                color="#ff4d6d"/>}
-                                </Map>
-                            </div>
-                            <div className="p-8">
-                                <button
-                                    onClick={() => setIsMapOpen(false)}
-                                    disabled={!selectedCoords}
-                                    className="w-full py-5 bg-black text-white rounded-full font-black text-lg disabled:opacity-20 transition-all"
-                                >
-                                    ПІДТВЕРДИТИ ЛОКАЦІЮ
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                )}
-            </AnimatePresence>
+          <p className="text-sm text-white/60">
+            Якщо MetaMask не вискакує — перевір, що сайт Remix/твій домен має доступ до MetaMask,
+            і що ти в мережі BNB Chain.
+          </p>
         </div>
-    );
+      </div>
+
+      {/* BLOCK 2 */}
+      <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+        <h2 className="text-lg font-semibold mb-3">2) Підтвердити виконання</h2>
+
+        <div className="space-y-3">
+          <input
+            className={inputBase}
+            value={confirmOrderId}
+            onChange={(e) => setConfirmOrderId(e.target.value)}
+            placeholder="orderId (число) напр. 101"
+          />
+
+          <textarea
+            className={inputBase}
+            style={{ minHeight: 110 }}
+            value={executorSignature}
+            onChange={(e) => setExecutorSignature(e.target.value)}
+            placeholder="executorSignature (підпис виконавця 0x...)"
+          />
+
+          <button className={btnSecondary} onClick={onConfirmCompletion}>
+            Підтвердити виконання (release)
+          </button>
+
+          <p className="text-sm text-white/60">
+            Цей підпис має надати виконавець (performer). Без нього контракт навмисно не відпускає кошти.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
 }
